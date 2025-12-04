@@ -1,0 +1,19 @@
+# Carpetas de datos
+data/
+datasets/
+.data/
+
+# Archivos de datos
+*.csv
+*.tsv
+*.parquet
+*.xlsx
+*.zip
+*.json
+
+# Cosas típicas de Python
+__pycache__/
+*.py[cod]
+.env
+.venv/
+.ipynb_checkpoints/
