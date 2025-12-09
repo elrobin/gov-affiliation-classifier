@@ -1,0 +1,11 @@
+2025-12-04 12:14:02,393 INFO gov-affiliation-classifier - Reading input CSV: us_full.csv
+2025-12-04 12:14:02,403 INFO gov-affiliation-classifier - Loading ROR knowledge base...
+2025-12-04 12:14:02,403 INFO gov-affiliation-classifier.ror - Loading ROR dump from: v1.74-2025-11-24-ror-data/v1.74-2025-11-24-ror-data.json
+2025-12-04 12:14:04,668 INFO gov-affiliation-classifier.ror - Loaded 120196 organizations from ROR dump
+2025-12-04 12:14:04,668 INFO gov-affiliation-classifier.ror - Building ROR index from 120196 organizations...
+2025-12-04 12:14:10,788 INFO gov-affiliation-classifier.ror - ROR index built: 200007 normalized names, 230 countries
+2025-12-04 12:14:10,789 INFO gov-affiliation-classifier - ROR knowledge base loaded successfully
+2025-12-04 12:14:10,789 INFO gov-affiliation-classifier - Classifying 9473 rows...
+2025-12-05 18:51:03,723 INFO gov-affiliation-classifier - Classification complete: 854 rule-based, 8619 LLM calls
+2025-12-05 18:51:03,787 INFO gov-affiliation-classifier - Writing output CSV: us_results.csv
+2025-12-05 18:51:03,880 INFO gov-affiliation-classifier - Done.
