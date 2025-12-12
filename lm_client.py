@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import logging
 import re
 import requests
 from dotenv import load_dotenv
@@ -20,6 +21,8 @@ except ImportError:
 # Load environment variables from an optional .env file.
 load_dotenv()
 
+LOGGER = logging.getLogger("gov-affiliation-classifier.lm_client")
+
 
 LM_STUDIO_BASE_URL = os.environ.get(
     "LM_STUDIO_BASE_URL", "http://localhost:1234/v1/chat/completions"
@@ -28,77 +31,345 @@ LM_STUDIO_MODEL_NAME = os.environ.get("LM_STUDIO_MODEL_NAME", "local-model")
 LM_STUDIO_TIMEOUT = float(os.environ.get("LM_STUDIO_TIMEOUT", "60"))
 
 SYSTEM_PROMPT = """\
-You classify institutional affiliations into a structured taxonomy.  
- 
-Given:  
-- an affiliation string,  
-- a country code (ISO-2), and  
-- optionally a ROR match,  
- 
-return ONLY a valid JSON with:  
- 
-- "org_type": one of ["supranational_organization","government","university","research_institute","company","ngo","hospital","other"]  
-- "gov_level": ["federal","state","local","unknown","non_applicable"]  
-- "gov_local_type": ["city","county","other_local","unknown","non_applicable"]  
-- "mission_research_category": ["NonResearch","Enabler","AppliedResearch","AcademicResearch"]  
-- "mission_research": 0 or 1  
-- "rationale": ""  
- 
-# 1. ORG TYPE RULES  
-- government = federal, state, or local public entities (ministries, departments, agencies, military).  
-- university = higher education institutions (not consortia).  
-  Academic departments (“Department of X”, “School of Y”) belong to a university unless clearly a government unit.  
-- research_institute = organizations primarily dedicated to research (public or private).  
-- company = private for-profit enterprises.  
-- ngo = non-profits, associations, alliances, networks (not single universities).  
-- hospital = healthcare institutions unless clearly private-company.  
-  Veterans Affairs Medical Centers = government / federal / NonResearch unless explicitly research-focused.  
-- supranational_organization = UN, EU, WHO, etc.  
-- other = conceptual or non-institutional entities.  
- 
-# 2. SPECIAL PATTERNS  
-Military entities (Air Force, Army, Navy, DoD):  
-→ org_type="government", gov_level="federal".  
- 
-University consortia or alliances:  
-→ not "university"; usually "ngo".  
- 
-Academic departments:  
-→ classify as university unless explicit government context.  
- 
-Labs and Centers:  
-- If linked to a university → AcademicResearch.  
-- If part of government → AppliedResearch.  
-- If corporate cues (Inc, LLC, Technologies, Biosciences, etc.) → company.  
- 
-Museums / Heritage / Preservation:  
-- Usually ngo unless explicit government ownership (City/County/State).  
- 
-# 3. GOV LEVEL  
-- federal = national agencies (NIH, CDC, EPA, USGS, NOAA, VA hospitals, DoD units).  
-- state = state agencies.  
-- local = city/county/town departments; set gov_local_type accordingly.  
-- If org_type != government → gov_level="non_applicable".  
- 
-# 4. MISSION RESEARCH CATEGORY  
-Choose one:  
-- NonResearch (0): administrative units, municipal agencies, service providers, hospitals without research.  
-- Enabler (0): funding agencies, foundations.  
-- AppliedResearch (1): government labs, mission-oriented R&D, analytics divisions, corporate R&D.  
-- AcademicResearch (1): universities, research institutes, academic departments, academic medical centers.  
- 
-# 5. USE OF ROR (if provided)  
-- education → strong cue for university / AcademicResearch.  
-- government → if research terms → AppliedResearch; if administrative → NonResearch.  
-- healthcare → teaching hospitals → AcademicResearch.  
-- funder → Enabler.  
- 
-# 6. DERIVED FIELD  
-mission_research = 1 for AppliedResearch or AcademicResearch; else 0.  
- 
-# 7. FORMAT  
-Return only a JSON object with the required keys.  
-"rationale" = "".\
+You classify institutional affiliations into a structured taxonomy.
+
+Given:
+- an affiliation string,
+- a country code (ISO-2), and
+- optionally a ROR match,
+
+return ONLY a valid JSON with:
+
+- "org_type": one of ["supranational_organization","government","university","research_institute","company","ngo","hospital","other"]
+- "gov_level": ["federal","state","local","unknown","non_applicable"]
+- "gov_local_type": ["city","county","other_local","unknown","non_applicable"]
+- "mission_research_category": ["NonResearch","Enabler","AppliedResearch","AcademicResearch"]
+- "mission_research": 0 or 1
+- "rationale": ""
+
+# 1. ORG TYPE RULES
+
+- government = federal, state, or local public entities (ministries, departments, agencies, regulatory bodies, military units).
+- university = higher education institutions and systems CONSISTING OF UNIVERSITIES:
+  - Single universities, colleges, campuses.
+  - Academic departments (“Department of X”, “School of Y”, “Faculty of Z”).
+  - Alliances / consortia / systems / networks COMPOSED OF universities or higher education institutions
+    (e.g. “University of California System”, “Association of American Universities”).
+- research_institute = organizations primarily dedicated to research (public or private) that are NOT clearly universities.
+- company = private for-profit enterprises (Inc, LLC, Corp, Ltd, Technologies, Biosciences, etc.).
+- ngo = non-profit organizations, associations, foundations, alliances or networks that are NOT single universities or clear university-only systems.
+- hospital = healthcare institutions (hospitals, medical centers, clinics), unless clearly private-company only.
+  - Veterans Affairs Medical Centers = government / federal / NonResearch unless explicitly research-focused.
+- supranational_organization = UN, EU, WHO, OECD, World Bank, etc.
+- other = conceptual or non-institutional entities, or ambiguous cases that do not fit the above types.
+
+Academic departments:
+- If the affiliation is a department, school, faculty, college or laboratory clearly associated with a university,
+  classify org_type="university" unless there is explicit government context (e.g. "Department of Health, State of X").
+
+"Department of X" pattern - CRITICAL RULE:
+- If the affiliation is "Department of X" (or similar patterns like "Department of X, Y" where Y is not a government entity):
+  - If X corresponds to an ACADEMIC DISCIPLINE (e.g., Philosophy, Computer Science, Mathematics, Physics, Chemistry, Biology, History, Literature, Educational Sciences, Psychology, Sociology, Economics, etc.), 
+    → classify as org_type="university" and mission_research_category="AcademicResearch", 
+    EVEN IF the word "University" does not appear in the affiliation string.
+  - If X corresponds to an ADMINISTRATIVE or MINISTERIAL FUNCTION (e.g., Energy, Education, Health, Transportation, Defense, Commerce, Labor, Agriculture, Interior, Justice, Treasury, etc.), 
+    → classify as org_type="government" and mission_research_category="NonResearch".
+  - This rule applies even when the affiliation is just "Department of X" without additional context.
+
+# 2. SPECIAL PATTERNS
+
+Military entities (Air Force, Army, Navy, DoD):
+→ org_type="government", gov_level="federal".
+
+University consortia, alliances or systems:
+→ If they are alliances / consortia / systems composed of universities or higher education institutions,
+   classify as org_type="university", NOT as ngo.
+
+Labs and Centers:
+- If clearly linked to a university (e.g. “Center for X, University of Y”, “Institute for Z at Harvard University”)
+  → org_type="university".
+- If part of government agencies → org_type="government".
+- If clearly corporate (Inc, LLC, Technologies, Biosciences, Labs, Pharmaceuticals, etc.) → org_type="company".
+- If independent and primarily research, not clearly a university → org_type="research_institute".
+
+Museums / Heritage / Preservation:
+- Usually ngo, unless there is explicit government ownership (City/County/State/National Museum),
+  in which case org_type="government".
+
+# 3. GOV LEVEL
+
+- gov_level="federal" for national agencies (NIH, CDC, EPA, USGS, NOAA, VA hospitals, DoD units, national ministries).
+- gov_level="state" for state-level agencies, state departments, state universities when they are clearly state public bodies.
+- gov_level="local" for city/county/town departments:
+  - If city-level → gov_local_type="city".
+  - If county-level → gov_local_type="county".
+  - If other local public body → gov_local_type="other_local".
+- If org_type="government" and the level is unclear → gov_level="unknown", gov_local_type="unknown".
+
+**IMPORTANT CONSTRAINT (E):**
+If org_type != "government", you MUST set:
+  - gov_level = "non_applicable"
+  - gov_local_type = "non_applicable"
+
+Never assign "federal", "state", "local" or "unknown" when org_type is not "government".
+
+# 4. MISSION RESEARCH CATEGORY
+
+Choose exactly one mission_research_category:
+
+- "NonResearch":
+  - Administrative units, municipal agencies, service providers.
+  - Hospitals without explicit teaching or research role.
+  - Purely operational government departments.
+- "Enabler":
+  - Funding agencies, philanthropic foundations, funders, research councils,
+    or organizations whose main role is to enable / finance research rather than perform it.
+- "AppliedResearch":
+  - Government labs, mission-oriented R&D units, analytics divisions.
+  - Corporate R&D centers, industrial labs, applied technology organizations.
+- "AcademicResearch":
+  - Universities, academic departments, graduate schools.
+  - Public or private research institutes with a primarily academic research mission.
+  - Academic medical centers and teaching hospitals with strong research activity.
+
+Default mapping (without considering ROR):
+- mission_research = 1 if mission_research_category in ["AppliedResearch","AcademicResearch"].
+- mission_research = 0 if mission_research_category in ["NonResearch","Enabler"].
+
+# 5. USE OF ROR (IF PROVIDED)
+
+If a valid ROR record is provided (ror_id is not empty), you MUST use it as a strong prior:
+
+- ROR types:
+  - "Education": strong cue for org_type="university".
+  - "Government": strong cue for org_type="government".
+  - "Healthcare": strong cue for org_type="hospital" (or university if clearly a teaching hospital).
+  - "Nonprofit": strong cue for org_type="ngo".
+  - "Facility", "Research Institute": strong cue for org_type="research_institute".
+  - "Company": strong cue for org_type="company".
+  - "Funder": strong cue for mission_research_category="Enabler".
+
+ROR and research mission (NEW RULE):
+- If THERE IS a valid ROR match:
+  - You MUST assume the organization is part of the research ecosystem.
+  - mission_research MUST be 1.
+  - mission_research_category MUST NOT be "NonResearch".
+  - You MUST choose among ["AcademicResearch","AppliedResearch","Enabler"] based on the role:
+    - Universities, research institutes, academic hospitals → "AcademicResearch".
+    - Government or corporate research labs → "AppliedResearch".
+    - Funders, research councils, philanthropic funders → "Enabler".
+
+If there is NO ROR match:
+- Use only the affiliation text and country context to infer org_type, gov_level, and mission_research_category.
+- In this case, you MAY use "NonResearch" if appropriate.
+
+ROR can be overridden by very strong evidence in the affiliation string,
+but in most cases you should align with ROR type and domain.
+
+# 6. DERIVED FIELD
+
+Normally:
+- mission_research = 1 for "AppliedResearch" or "AcademicResearch".
+- mission_research = 0 for "NonResearch" or "Enabler".
+
+EXCEPTION:
+- If a valid ROR record exists, mission_research MUST be 1,
+  and mission_research_category MUST be one of ["AppliedResearch","AcademicResearch","Enabler"].
+
+# 7. OUTPUT FORMAT
+
+Return ONLY a JSON object with all required keys:
+- "org_type"
+- "gov_level"
+- "gov_local_type"
+- "mission_research_category"
+- "mission_research"
+- "rationale"
+
+"rationale" MUST be a string (can be short).
+
+No extra text, no explanations outside the JSON.
+
+# 8. EXAMPLES (COMPLEX CASES)
+
+Example 1: Government department (administrative function)
+Affiliation: "Department of Energy"
+Country: "US"
+→ government, NonResearch
+
+{
+  "org_type": "government",
+  "gov_level": "federal",
+  "gov_local_type": "non_applicable",
+  "mission_research_category": "NonResearch",
+  "mission_research": 0,
+  "rationale": "Federal government department with administrative and policy functions, not primarily a research organization."
+}
+
+Example 2: Government department (administrative function)
+Affiliation: "Department of Education"
+Country: "US"
+→ government, NonResearch
+
+{
+  "org_type": "government",
+  "gov_level": "federal",
+  "gov_local_type": "non_applicable",
+  "mission_research_category": "NonResearch",
+  "mission_research": 0,
+  "rationale": "Federal government department with administrative and policy functions, not primarily a research organization."
+}
+
+Example 3: Academic department (academic discipline)
+Affiliation: "Department of Philosophy"
+Country: "US"
+→ university, AcademicResearch
+
+{
+  "org_type": "university",
+  "gov_level": "non_applicable",
+  "gov_local_type": "non_applicable",
+  "mission_research_category": "AcademicResearch",
+  "mission_research": 1,
+  "rationale": "Academic department of an academic discipline, performing teaching and research activities."
+}
+
+Example 4: Academic department (academic discipline)
+Affiliation: "Department of Educational Sciences"
+Country: "US"
+→ university, AcademicResearch
+
+{
+  "org_type": "university",
+  "gov_level": "non_applicable",
+  "gov_local_type": "non_applicable",
+  "mission_research_category": "AcademicResearch",
+  "mission_research": 1,
+  "rationale": "Academic department of an academic discipline, performing teaching and research activities."
+}
+
+Example 5: Academic department (academic discipline)
+Affiliation: "Department of Computer Science"
+Country: "US"
+→ university, AcademicResearch
+
+{
+  "org_type": "university",
+  "gov_level": "non_applicable",
+  "gov_local_type": "non_applicable",
+  "mission_research_category": "AcademicResearch",
+  "mission_research": 1,
+  "rationale": "Academic department of an academic discipline, performing teaching and research activities."
+}
+
+Example 6: City public health department
+Affiliation: "Division of Family Health, Rhode Island Department of Health"
+Country: "US"
+→ government, local, NonResearch
+
+{
+  "org_type": "government",
+  "gov_level": "state",
+  "gov_local_type": "other_local",
+  "mission_research_category": "NonResearch",
+  "mission_research": 0,
+  "rationale": "State department of health providing public health services, not primarily a research organization."
+}
+
+Example 7: University department
+Affiliation: "Department of Computer Science, Stanford University"
+Country: "US"
+→ university, AcademicResearch
+
+{
+  "org_type": "university",
+  "gov_level": "non_applicable",
+  "gov_local_type": "non_applicable",
+  "mission_research_category": "AcademicResearch",
+  "mission_research": 1,
+  "rationale": "Academic department within a university, with teaching and research."
+}
+
+Example 8: Alliance of universities
+Affiliation: "Association of American Universities"
+Country: "US"
+→ university, Enabler or AcademicResearch depending on role
+
+{
+  "org_type": "university",
+  "gov_level": "non_applicable",
+  "gov_local_type": "non_applicable",
+  "mission_research_category": "Enabler",
+  "mission_research": 1,
+  "rationale": "Alliance of research universities that coordinates and enables academic research."
+}
+
+Example 9: Corporate R&D center with NO ROR
+Affiliation: "3 Dimensional Pharmaceuticals, Inc."
+Country: "US"
+
+{
+  "org_type": "company",
+  "gov_level": "non_applicable",
+  "gov_local_type": "non_applicable",
+  "mission_research_category": "AppliedResearch",
+  "mission_research": 1,
+  "rationale": "Private pharmaceutical company with R&D activities."
+}
+
+Example 10: Government laboratory WITH ROR
+Affiliation: "National Security Technologies, LLC"
+Country: "US"
+ROR types: "Government, Facility"
+
+{
+  "org_type": "government",
+  "gov_level": "federal",
+  "gov_local_type": "non_applicable",
+  "mission_research_category": "AppliedResearch",
+  "mission_research": 1,
+  "rationale": "Federal government-related facility performing mission-oriented research and development."
+}
+
+Example 11: Funder WITH ROR
+Affiliation: "Georgia Clinical & Translational Science Alliance"
+Country: "US"
+ROR types: "Facility, Funder"
+
+{
+  "org_type": "university",
+  "gov_level": "non_applicable",
+  "gov_local_type": "non_applicable",
+  "mission_research_category": "Enabler",
+  "mission_research": 1,
+  "rationale": "Alliance of universities acting as a research enabler and funder in the clinical and translational research ecosystem."
+}
+"""
+
+SYSTEM_PROMPT_BATCH = """\
+You classify multiple institutional affiliations into a structured taxonomy.
+
+Given an array of items, each with:
+- an id (unique identifier),
+- an affiliation string,
+- a country code (ISO-2), and
+- optionally a ROR match,
+
+return ONLY a valid JSON array with the same number of items, in the EXACT SAME ORDER as the input.
+
+Each item in the output array must be a JSON object with:
+
+- "id": the same id from the input
+- "org_type": one of ["supranational_organization","government","university","research_institute","company","ngo","hospital","other"]
+- "gov_level": ["federal","state","local","unknown","non_applicable"]
+- "gov_local_type": ["city","county","other_local","unknown","non_applicable"]
+- "mission_research_category": ["NonResearch","Enabler","AppliedResearch","AcademicResearch"]
+- "mission_research": 0 or 1
+- "rationale": ""
+
+Follow the same rules as the single-item classification prompt for each item.
+
+CRITICAL: You MUST return a JSON array, not a single object. The array must have exactly the same length and order as the input.
 """
 
 
@@ -122,10 +393,14 @@ def _extract_json_object(text: str) -> str:
         cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
         cleaned = re.sub(r"```$", "", cleaned).strip()
 
-    # Look for the first {...} block
-    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-    if match:
-        return match.group(0).strip()
+    # Look for the first {...} block or [...] array
+    match_arr = re.search(r"\[.*\]", cleaned, flags=re.DOTALL)
+    match_obj = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    
+    if match_arr:
+        return match_arr.group(0).strip()
+    elif match_obj:
+        return match_obj.group(0).strip()
 
     # Fallback: assume entire content is JSON
     return cleaned
@@ -295,7 +570,7 @@ def _post_chat_completion(payload: Dict[str, Any]) -> Dict[str, Any]:
     response = requests.post(
         LM_STUDIO_BASE_URL,
         json=payload,
-        timeout=LM_STUDIO_TIMEOUT,
+        timeout=300,
     )
     if response.status_code != 200:
         raise LMStudioError(
@@ -482,4 +757,199 @@ def classify_affiliation(
             )
     
     return parsed
+
+
+def classify_affiliations_batch(
+    items: List[Dict[str, Any]], max_retries: int = 2
+) -> List[Dict[str, Any]]:
+    """
+    Classify multiple affiliations in a single LLM call (batch processing).
+
+    Parameters
+    ----------
+    items:
+        List of dicts, each with keys: "id", "affiliation", "country_code", and optionally "ror_match".
+    max_retries:
+        Maximum number of retry attempts with smaller batches if parsing fails.
+
+    Returns
+    -------
+    List[Dict[str, Any]]
+        List of classification results, one per input item, in the same order.
+    """
+    if not items:
+        return []
+
+    # Build batch request
+    batch_data = []
+    for item in items:
+        entry: Dict[str, Any] = {
+            "id": item["id"],
+            "affiliation": str(item["affiliation"]).strip(),
+            "country_code": str(item.get("country_code", "")).strip(),
+        }
+        if "ror_match" in item and item["ror_match"] is not None:
+            ror_match = item["ror_match"]
+            entry["ror_match"] = {
+                "ror_id": ror_match.ror_id,
+                "ror_name": ror_match.ror_name,
+                "ror_types": ror_match.ror_types,
+                "ror_country_code": ror_match.ror_country_code,
+                "ror_state": ror_match.ror_state,
+                "ror_city": ror_match.ror_city,
+                "ror_domains": ror_match.ror_domains,
+                "match_score": ror_match.match_score,
+            }
+            if ror_match.suggested_org_type_from_ror:
+                entry["ror_match"]["suggested_org_type_from_ror"] = ror_match.suggested_org_type_from_ror
+        batch_data.append(entry)
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT_BATCH},
+        {
+            "role": "user",
+            "content": json.dumps(batch_data),
+        },
+    ]
+    payload = {
+        "model": LM_STUDIO_MODEL_NAME,
+        "messages": messages,
+        "temperature": 0.0,
+        "max_tokens": 5000,  # Increased for batch processing
+    }
+
+    try:
+        completion = _post_chat_completion(payload)
+        content = completion["choices"][0]["message"]["content"]
+        json_str = _extract_json_object(content)
+        parsed_array = json.loads(json_str)
+    except (KeyError, IndexError, json.JSONDecodeError, ValueError) as exc:
+        # If parsing fails and we can retry with smaller batch, do so
+        if len(items) > 1 and max_retries > 0:
+            LOGGER.warning(
+                "Batch parsing failed for %d items, splitting in half and retrying. Error: %s",
+                len(items),
+                exc,
+            )
+            mid = len(items) // 2
+            first_half = classify_affiliations_batch(items[:mid], max_retries - 1)
+            second_half = classify_affiliations_batch(items[mid:], max_retries - 1)
+            return first_half + second_half
+        else:
+            raise LMStudioError(f"Invalid batch response format from LM Studio: {content!r}") from exc
+
+    # Validate that we got an array
+    if not isinstance(parsed_array, list):
+        raise LMStudioError(f"Expected JSON array, got {type(parsed_array)}: {json.dumps(parsed_array)[:200]}")
+
+    # Validate length matches
+    if len(parsed_array) != len(items):
+        raise LMStudioError(
+            f"Response array length {len(parsed_array)} does not match input length {len(items)}"
+        )
+
+    # Normalize and validate each result
+    results = []
+    id_to_index = {item["id"]: idx for idx, item in enumerate(items)}
+    
+    for result_item in parsed_array:
+        # Normalize each result using the same logic as single-item classification
+        valid_org_types = {
+            "supranational_organization",
+            "government",
+            "university",
+            "research_institute",
+            "company",
+            "ngo",
+            "hospital",
+            "other",
+        }
+        valid_gov_levels = {"federal", "state", "local", "unknown", "non_applicable"}
+        valid_gov_local_types = {"city", "county", "other_local", "unknown", "non_applicable"}
+        valid_mission_categories = {"NonResearch", "Enabler", "AppliedResearch", "AcademicResearch"}
+
+        # Fix org_type if invalid
+        if result_item.get("org_type") not in valid_org_types:
+            result_item["org_type"] = "other"
+
+        # Fix gov_level if invalid
+        if result_item.get("gov_level") not in valid_gov_levels:
+            result_item["gov_level"] = "non_applicable"
+
+        # Fix gov_local_type if invalid
+        if result_item.get("gov_local_type") not in valid_gov_local_types:
+            result_item["gov_local_type"] = "non_applicable"
+
+        # If org_type is NOT "government", force both gov fields to "non_applicable"
+        if result_item.get("org_type") != "government":
+            result_item["gov_level"] = "non_applicable"
+            result_item["gov_local_type"] = "non_applicable"
+
+        # If org_type is "government" but gov_level is NOT "local", force gov_local_type to "non_applicable"
+        if result_item.get("org_type") == "government" and result_item.get("gov_level") != "local":
+            result_item["gov_local_type"] = "non_applicable"
+
+        # Validate mission_research_category
+        mission_category = result_item.get("mission_research_category")
+        if mission_category not in valid_mission_categories:
+            mission_category_lower = str(mission_category).lower() if mission_category else ""
+            if "non" in mission_category_lower or "none" in mission_category_lower:
+                result_item["mission_research_category"] = "NonResearch"
+            elif "enabler" in mission_category_lower or "enable" in mission_category_lower:
+                result_item["mission_research_category"] = "Enabler"
+            elif "applied" in mission_category_lower:
+                result_item["mission_research_category"] = "AppliedResearch"
+            elif "academic" in mission_category_lower:
+                result_item["mission_research_category"] = "AcademicResearch"
+            else:
+                result_item["mission_research_category"] = "NonResearch"
+            mission_category = result_item["mission_research_category"]
+
+        # Derive mission_research
+        if "mission_research" not in result_item or result_item.get("mission_research") is None:
+            result_item["mission_research"] = 1 if mission_category in {"AppliedResearch", "AcademicResearch"} else 0
+        else:
+            expected_mission_research = 1 if mission_category in {"AppliedResearch", "AcademicResearch"} else 0
+            result_item["mission_research"] = expected_mission_research
+
+        # Add confidence fields for compatibility
+        if "confidence_org_type" not in result_item:
+            result_item["confidence_org_type"] = None
+        if "confidence_gov_level" not in result_item:
+            result_item["confidence_gov_level"] = None
+        if "confidence_mission_research" not in result_item:
+            result_item["confidence_mission_research"] = None
+
+        # Ensure rationale exists
+        if "rationale" not in result_item:
+            result_item["rationale"] = ""
+
+        results.append(result_item)
+
+    # Sort results by original input order using id mapping
+    results_sorted = [None] * len(items)
+    for result in results:
+        result_id = result.get("id")
+        if result_id in id_to_index:
+            results_sorted[id_to_index[result_id]] = result
+        else:
+            LOGGER.warning("Result with id '%s' not found in input items", result_id)
+
+    # Fill any missing results with error placeholders
+    for idx, result in enumerate(results_sorted):
+        if result is None:
+            results_sorted[idx] = {
+                "id": items[idx]["id"],
+                "org_type": None,
+                "gov_level": None,
+                "gov_local_type": None,
+                "mission_research_category": None,
+                "mission_research": None,
+                "confidence_org_type": None,
+                "confidence_gov_level": None,
+                "confidence_mission_research": None,
+                "rationale": "Error: Result missing from batch response",
+            }
+
+    return results_sorted
 
