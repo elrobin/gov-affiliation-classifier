@@ -7,10 +7,12 @@ A Python utility for classifying institutional affiliations using a hybrid appro
 
 The classifier determines:
 - Organization type (`org_type`)
-- Government level (`gov_level`) for US entities
+- Government level (`gov_level`) - primarily defined for USA (federal, state, local), extensible to other countries
 - Local government type (`gov_local_type`)
 - Research mission category (`mission_research_category`)
 - Research mission binary flag (`mission_research`)
+
+**Note:** This tool is designed for research analysis and does not reproduce official administrative classifications.
 
 ## Features
 
@@ -23,6 +25,8 @@ The system uses a two-stage approach for efficiency:
    - Teaching hospitals with academic links
 
 2. **LLM classification** (when needed): For ambiguous cases, complex organizations, or when ROR data is unavailable.
+
+3. **Prompt & parsing safeguards:** The prompt now enforces ROR-aligned research mission (mission_research=1 when a valid ROR match exists and mission_research_category limited to AcademicResearch/AppliedResearch/Enabler) and the client extracts JSON robustly even if the model wraps it in ```json fences.
 
 ### 📊 Output Fields
 
@@ -47,11 +51,15 @@ The classifier produces a CSV with the following fields:
 - `ror_match_score`: Match confidence score (0.0-1.0)
 - `suggested_org_type_from_ror`: Suggested organization type based on ROR types
 
-**Metadata fields:**
-- `confidence_org_type`: Confidence score (kept for compatibility, not actively used)
-- `confidence_gov_level`: Confidence score (kept for compatibility, not actively used)
-- `confidence_mission_research`: Confidence score (kept for compatibility, not actively used)
-- `rationale`: Empty string (reserved for future use)
+## Current Scope (v1.0)
+
+### Geographic Scope
+
+The `gov_level` field is currently defined and validated primarily for **USA** (federal, state, local). The design is extensible to other countries, but administrative taxonomies are not yet country-specific. For non-US entities, the classifier may assign `gov_level="unknown"` or `gov_level="non_applicable"` depending on the organization type.
+
+### Academic Use
+
+**Important:** This tool is designed for **research analysis purposes** and does not aim to reproduce official administrative classifications. The taxonomy and classifications are intended for academic and research use, not for official government or legal purposes.
 
 ## Installation
 
@@ -191,6 +199,8 @@ The binary `mission_research` flag is automatically derived:
 - `1` for `AppliedResearch` or `AcademicResearch`
 - `0` for `NonResearch` or `Enabler`
 
+**ROR prior (prompt rule):** when a valid ROR record is present, the prompt instructs the model to treat the organization as part of the research ecosystem, set `mission_research` = 1, and pick `mission_research_category` from `AcademicResearch`, `AppliedResearch`, or `Enabler` according to ROR role cues.
+
 ## Performance
 
 The hybrid approach significantly reduces LLM calls:
@@ -207,7 +217,7 @@ Classification complete: 45 rule-based, 55 LLM calls
 
 - If ROR dump fails to load, the system continues without ROR matching
 - If ROR matching fails for a specific affiliation, it falls back to LLM
-- If LLM call fails, the row is marked with error in `rationale` field
+- If LLM call fails, classification fields are set to `None` for that row
 - All errors are logged for debugging
 
 ## Dependencies
