@@ -55,7 +55,7 @@ The classifier produces a CSV with the following fields:
 
 ### Geographic Scope
 
-The `gov_level` field is currently defined and validated primarily for **USA** (federal, state, local). The design is extensible to other countries, but administrative taxonomies are not yet country-specific. For non-US entities, the classifier may assign `gov_level="unknown"` or `gov_level="non_applicable"` depending on the organization type.
+In v1.0, `gov_level` is primarily validated for U.S. affiliations (federal / state / local). For other countries, values may be `unknown` or `non_applicable`. The design is extensible to other countries, but administrative taxonomies are not yet country-specific.
 
 ### Academic Use
 
@@ -213,6 +213,16 @@ The system logs statistics:
 Classification complete: 45 rule-based, 55 LLM calls
 ```
 
+## Performance and Limitations
+
+The classifier is designed for **local execution** with LM Studio. When running on CPU-only local LLMs, some complex batches may take several minutes to complete. The pipeline is designed to favor conservative inference and fallback mechanisms over aggressive parallelization.
+
+**Important considerations:**
+- In CPU-only setups, long-running batch inference may be slow
+- Complex batches with many ambiguous cases may require several minutes per batch
+- The system prioritizes robustness and correctness over speed
+- Timeouts are set conservatively to accommodate slower inference on CPU
+
 ## Error Handling
 
 - If ROR dump fails to load, the system continues without ROR matching
@@ -226,6 +236,10 @@ Classification complete: 45 rule-based, 55 LLM calls
 - `requests>=2.31`: HTTP client for LM Studio API
 - `python-dotenv>=1.0`: Environment variable management
 - `rapidfuzz>=3.0`: Fuzzy string matching for ROR
+
+## Future Improvements
+
+Future versions may include checkpointing and resume capabilities for very large datasets, allowing the pipeline to recover from interruptions and continue processing from the last successful batch.
 
 ## License
 

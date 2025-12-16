@@ -377,6 +377,104 @@ class LMStudioError(RuntimeError):
     """Raised when the LM Studio request fails or returns invalid data."""
 
 
+def _is_technical_error(exception: Exception) -> bool:
+    """
+    Determine if an exception represents a technical error (network, timeout, etc.)
+    that should trigger retry/fallback, vs semantic uncertainty that should be
+    handled with 'unknown' values.
+    
+    Returns True for technical errors, False for semantic uncertainty.
+    """
+    import requests
+    
+    # Technical errors: network issues, timeouts, connection failures
+    if isinstance(exception, (requests.exceptions.ConnectionError,
+                              requests.exceptions.Timeout,
+                              requests.exceptions.RequestException)):
+        return True
+    
+    # LMStudioError with technical indicators
+    if isinstance(exception, LMStudioError):
+        error_str = str(exception).lower()
+        technical_indicators = [
+            "timeout",
+            "connection",
+            "network",
+            "status_code",
+            "invalid response format",  # JSON completely unparseable
+        ]
+        if any(indicator in error_str for indicator in technical_indicators):
+            return True
+    
+    # JSON decode errors that persist after retry are technical
+    if isinstance(exception, (json.JSONDecodeError, ValueError)):
+        # If we can't extract any JSON at all, it's technical
+        # But if we have partial JSON, it's semantic
+        return False  # Treat as semantic - we'll normalize to unknown
+    
+    return False
+
+
+def _normalize_to_unknown(result_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize a result dictionary to ensure no None/NaN values in analytical fields.
+    Replaces missing or invalid values with appropriate defaults ('unknown' or 'non_applicable').
+    """
+    valid_org_types = {
+        "supranational_organization", "government", "university", "research_institute",
+        "company", "ngo", "hospital", "other", "unknown"
+    }
+    valid_gov_levels = {"federal", "state", "local", "unknown", "non_applicable"}
+    valid_gov_local_types = {"city", "county", "other_local", "unknown", "non_applicable"}
+    valid_mission_categories = {"NonResearch", "Enabler", "AppliedResearch", "AcademicResearch", "unknown"}
+    
+    # Normalize org_type
+    org_type = result_dict.get("org_type")
+    if not org_type or org_type not in valid_org_types:
+        org_type = "unknown"
+        result_dict["org_type"] = org_type
+    
+    # Normalize gov_level based on org_type
+    gov_level = result_dict.get("gov_level")
+    if not gov_level or gov_level not in valid_gov_levels:
+        if org_type == "government":
+            gov_level = "unknown"
+        else:
+            gov_level = "non_applicable"
+        result_dict["gov_level"] = gov_level
+    
+    # Normalize gov_local_type based on gov_level
+    gov_local_type = result_dict.get("gov_local_type")
+    if not gov_local_type or gov_local_type not in valid_gov_local_types:
+        if org_type == "government" and gov_level == "local":
+            gov_local_type = "unknown"
+        else:
+            gov_local_type = "non_applicable"
+        result_dict["gov_local_type"] = gov_local_type
+    
+    # Normalize mission_research_category
+    mission_category = result_dict.get("mission_research_category")
+    if not mission_category or mission_category not in valid_mission_categories:
+        mission_category = "unknown"
+        result_dict["mission_research_category"] = mission_category
+    
+    # Derive mission_research from category
+    if mission_category in {"AppliedResearch", "AcademicResearch"}:
+        mission_research = 1
+    elif mission_category in {"NonResearch", "Enabler", "unknown"}:
+        mission_research = 0
+    else:
+        mission_research = 0  # Default fallback
+    
+    result_dict["mission_research"] = mission_research
+    
+    # Ensure rationale exists
+    if "rationale" not in result_dict:
+        result_dict["rationale"] = ""
+    
+    return result_dict
+
+
 def _extract_json_object(text: str) -> str:
     """
     Extract the first JSON object from a text response, stripping ``` fences.
@@ -570,7 +668,7 @@ def _post_chat_completion(payload: Dict[str, Any]) -> Dict[str, Any]:
     response = requests.post(
         LM_STUDIO_BASE_URL,
         json=payload,
-        timeout=300,
+        timeout=600,
     )
     if response.status_code != 200:
         raise LMStudioError(
@@ -657,66 +755,19 @@ def classify_affiliation(
     valid_gov_levels = {"federal", "state", "local", "unknown", "non_applicable"}
     valid_gov_local_types = {"city", "county", "other_local", "unknown", "non_applicable"}
 
-    # Fix org_type if invalid
-    if parsed.get("org_type") not in valid_org_types:
-        parsed["org_type"] = "other"
-
-    # Fix gov_level if invalid
-    if parsed.get("gov_level") not in valid_gov_levels:
-        parsed["gov_level"] = "non_applicable"
-
-    # Fix gov_local_type if invalid
-    if parsed.get("gov_local_type") not in valid_gov_local_types:
-        parsed["gov_local_type"] = "non_applicable"
-
-    # If org_type is NOT "government", force both gov fields to "non_applicable"
-    if parsed.get("org_type") != "government":
-        parsed["gov_level"] = "non_applicable"
-        parsed["gov_local_type"] = "non_applicable"
-
-    # If org_type is "government" but gov_level is NOT "local", force gov_local_type to "non_applicable"
-    if parsed.get("org_type") == "government" and parsed.get("gov_level") != "local":
-        parsed["gov_local_type"] = "non_applicable"
-
-    # Validate mission_research_category
-    valid_mission_categories = {"NonResearch", "Enabler", "AppliedResearch", "AcademicResearch"}
-    mission_category = parsed.get("mission_research_category")
-    if mission_category not in valid_mission_categories:
-        # Try to fix common variations
-        mission_category_lower = str(mission_category).lower() if mission_category else ""
-        if "non" in mission_category_lower or "none" in mission_category_lower:
-            parsed["mission_research_category"] = "NonResearch"
-        elif "enabler" in mission_category_lower or "enable" in mission_category_lower:
-            parsed["mission_research_category"] = "Enabler"
-        elif "applied" in mission_category_lower:
-            parsed["mission_research_category"] = "AppliedResearch"
-        elif "academic" in mission_category_lower:
-            parsed["mission_research_category"] = "AcademicResearch"
-        else:
-            parsed["mission_research_category"] = "NonResearch"  # Default fallback
-        mission_category = parsed["mission_research_category"]
+    # Normalize using helper function - this ensures no None/NaN values
+    parsed = _normalize_to_unknown(parsed)
     
-    # Derive mission_research from mission_research_category if not present or inconsistent
-    if "mission_research" not in parsed or parsed.get("mission_research") is None:
-        parsed["mission_research"] = 1 if mission_category in {"AppliedResearch", "AcademicResearch"} else 0
-    else:
-        # Ensure consistency: override mission_research based on category
-        expected_mission_research = 1 if mission_category in {"AppliedResearch", "AcademicResearch"} else 0
-        parsed["mission_research"] = expected_mission_research
-
-    required_keys = {
-        "org_type",
-        "gov_level",
-        "gov_local_type",
-        "mission_research_category",
-        "mission_research",
-        "rationale",
-    }
-    missing = required_keys - parsed.keys()
-    if missing:
-        raise LMStudioError(
-            f"Missing keys {missing} in LM Studio response: {json.dumps(parsed)}"
-        )
+    # Apply business logic constraints after normalization
+    org_type = parsed.get("org_type")
+    
+    # If org_type is NOT "government", force both gov fields to "non_applicable"
+    if org_type != "government":
+        parsed["gov_level"] = "non_applicable"
+        parsed["gov_local_type"] = "non_applicable"
+    # If org_type is "government" but gov_level is NOT "local", force gov_local_type to "non_applicable"
+    elif org_type == "government" and parsed.get("gov_level") != "local":
+        parsed["gov_local_type"] = "non_applicable"
     
     # Add confidence fields as empty/None for compatibility (not used but kept for CSV output)
     if "confidence_org_type" not in parsed:
@@ -725,36 +776,6 @@ def classify_affiliation(
         parsed["confidence_gov_level"] = None
     if "confidence_mission_research" not in parsed:
         parsed["confidence_mission_research"] = None
-    
-    # Validate org_type values
-    valid_org_types = {
-        "supranational_organization",
-        "government",
-        "university",
-        "research_institute",
-        "company",
-        "ngo",
-        "hospital",
-        "other",
-    }
-    org_type = parsed.get("org_type")
-    if org_type not in valid_org_types:
-        raise LMStudioError(
-            f"Invalid org_type '{org_type}'. Must be one of {valid_org_types}."
-        )
-    
-    # Enforce that gov_level and gov_local_type must be "non_applicable" when org_type != "government"
-    if org_type != "government":
-        if parsed.get("gov_level") != "non_applicable":
-            raise LMStudioError(
-                f"gov_level must be 'non_applicable' when org_type is '{org_type}', "
-                f"but got '{parsed.get('gov_level')}'."
-            )
-        if parsed.get("gov_local_type") != "non_applicable":
-            raise LMStudioError(
-                f"gov_local_type must be 'non_applicable' when org_type is '{org_type}', "
-                f"but got '{parsed.get('gov_local_type')}'."
-            )
     
     return parsed
 
@@ -842,89 +863,73 @@ def classify_affiliations_batch(
     if not isinstance(parsed_array, list):
         raise LMStudioError(f"Expected JSON array, got {type(parsed_array)}: {json.dumps(parsed_array)[:200]}")
 
-    # Validate length matches
-    if len(parsed_array) != len(items):
-        raise LMStudioError(
-            f"Response array length {len(parsed_array)} does not match input length {len(items)}"
+    # Handle length mismatch - be tolerant, complete missing items with "unknown"
+    if len(parsed_array) < len(items):
+        LOGGER.warning(
+            "Response array length %d is less than input length %d. Completing missing items with 'unknown'.",
+            len(parsed_array),
+            len(items)
         )
+        # Pad with empty dicts that will be normalized to "unknown"
+        parsed_array.extend([{}] * (len(items) - len(parsed_array)))
+    elif len(parsed_array) > len(items):
+        LOGGER.warning(
+            "Response array length %d is greater than input length %d. Truncating excess items.",
+            len(parsed_array),
+            len(items)
+        )
+        parsed_array = parsed_array[:len(items)]
 
-    # Normalize and validate each result
+    # Normalize and validate each result - tolerate partial failures
     results = []
     id_to_index = {item["id"]: idx for idx, item in enumerate(items)}
     
-    for result_item in parsed_array:
-        # Normalize each result using the same logic as single-item classification
-        valid_org_types = {
-            "supranational_organization",
-            "government",
-            "university",
-            "research_institute",
-            "company",
-            "ngo",
-            "hospital",
-            "other",
-        }
-        valid_gov_levels = {"federal", "state", "local", "unknown", "non_applicable"}
-        valid_gov_local_types = {"city", "county", "other_local", "unknown", "non_applicable"}
-        valid_mission_categories = {"NonResearch", "Enabler", "AppliedResearch", "AcademicResearch"}
-
-        # Fix org_type if invalid
-        if result_item.get("org_type") not in valid_org_types:
-            result_item["org_type"] = "other"
-
-        # Fix gov_level if invalid
-        if result_item.get("gov_level") not in valid_gov_levels:
-            result_item["gov_level"] = "non_applicable"
-
-        # Fix gov_local_type if invalid
-        if result_item.get("gov_local_type") not in valid_gov_local_types:
-            result_item["gov_local_type"] = "non_applicable"
-
-        # If org_type is NOT "government", force both gov fields to "non_applicable"
-        if result_item.get("org_type") != "government":
-            result_item["gov_level"] = "non_applicable"
-            result_item["gov_local_type"] = "non_applicable"
-
-        # If org_type is "government" but gov_level is NOT "local", force gov_local_type to "non_applicable"
-        if result_item.get("org_type") == "government" and result_item.get("gov_level") != "local":
-            result_item["gov_local_type"] = "non_applicable"
-
-        # Validate mission_research_category
-        mission_category = result_item.get("mission_research_category")
-        if mission_category not in valid_mission_categories:
-            mission_category_lower = str(mission_category).lower() if mission_category else ""
-            if "non" in mission_category_lower or "none" in mission_category_lower:
-                result_item["mission_research_category"] = "NonResearch"
-            elif "enabler" in mission_category_lower or "enable" in mission_category_lower:
-                result_item["mission_research_category"] = "Enabler"
-            elif "applied" in mission_category_lower:
-                result_item["mission_research_category"] = "AppliedResearch"
-            elif "academic" in mission_category_lower:
-                result_item["mission_research_category"] = "AcademicResearch"
-            else:
-                result_item["mission_research_category"] = "NonResearch"
-            mission_category = result_item["mission_research_category"]
-
-        # Derive mission_research
-        if "mission_research" not in result_item or result_item.get("mission_research") is None:
-            result_item["mission_research"] = 1 if mission_category in {"AppliedResearch", "AcademicResearch"} else 0
-        else:
-            expected_mission_research = 1 if mission_category in {"AppliedResearch", "AcademicResearch"} else 0
-            result_item["mission_research"] = expected_mission_research
-
-        # Add confidence fields for compatibility
-        if "confidence_org_type" not in result_item:
-            result_item["confidence_org_type"] = None
-        if "confidence_gov_level" not in result_item:
-            result_item["confidence_gov_level"] = None
-        if "confidence_mission_research" not in result_item:
-            result_item["confidence_mission_research"] = None
-
-        # Ensure rationale exists
-        if "rationale" not in result_item:
-            result_item["rationale"] = ""
-
-        results.append(result_item)
+    for idx, result_item in enumerate(parsed_array):
+        try:
+            # Normalize using helper function - ensures no None/NaN values
+            normalized = _normalize_to_unknown(result_item.copy() if result_item else {})
+            
+            # Apply business logic constraints after normalization
+            org_type = normalized.get("org_type")
+            if org_type != "government":
+                normalized["gov_level"] = "non_applicable"
+                normalized["gov_local_type"] = "non_applicable"
+            elif org_type == "government" and normalized.get("gov_level") != "local":
+                normalized["gov_local_type"] = "non_applicable"
+            
+            # Add confidence fields for compatibility
+            if "confidence_org_type" not in normalized:
+                normalized["confidence_org_type"] = None
+            if "confidence_gov_level" not in normalized:
+                normalized["confidence_gov_level"] = None
+            if "confidence_mission_research" not in normalized:
+                normalized["confidence_mission_research"] = None
+            
+            # Ensure id is present
+            if "id" not in normalized and idx < len(items):
+                normalized["id"] = items[idx]["id"]
+            
+            results.append(normalized)
+        except Exception as exc:
+            # If normalization fails, create a result with "unknown" values
+            LOGGER.warning(
+                "Failed to normalize batch result item %d: %s. Using 'unknown' values.",
+                idx,
+                exc
+            )
+            unknown_result = {
+                "id": items[idx]["id"] if idx < len(items) else None,
+                "org_type": "unknown",
+                "gov_level": "unknown",
+                "gov_local_type": "unknown",
+                "mission_research_category": "unknown",
+                "mission_research": 0,
+                "confidence_org_type": None,
+                "confidence_gov_level": None,
+                "confidence_mission_research": None,
+                "rationale": f"Normalization error: {exc}",
+            }
+            results.append(unknown_result)
 
     # Sort results by original input order using id mapping
     results_sorted = [None] * len(items)
@@ -935,20 +940,20 @@ def classify_affiliations_batch(
         else:
             LOGGER.warning("Result with id '%s' not found in input items", result_id)
 
-    # Fill any missing results with error placeholders
+    # Fill any missing results with "unknown" values (not None)
     for idx, result in enumerate(results_sorted):
         if result is None:
             results_sorted[idx] = {
                 "id": items[idx]["id"],
-                "org_type": None,
-                "gov_level": None,
-                "gov_local_type": None,
-                "mission_research_category": None,
-                "mission_research": None,
+                "org_type": "unknown",
+                "gov_level": "unknown",
+                "gov_local_type": "unknown",
+                "mission_research_category": "unknown",
+                "mission_research": 0,
                 "confidence_org_type": None,
                 "confidence_gov_level": None,
                 "confidence_mission_research": None,
-                "rationale": "Error: Result missing from batch response",
+                "rationale": "Result missing from batch response",
             }
 
     return results_sorted

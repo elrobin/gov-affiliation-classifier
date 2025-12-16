@@ -9,7 +9,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from lm_client import LMStudioError, classify_affiliation, classify_affiliations_batch, try_rule_based_classification
+from lm_client import (
+    LMStudioError,
+    classify_affiliation,
+    classify_affiliations_batch,
+    try_rule_based_classification,
+    _is_technical_error,
+)
 from ror_knowledge import RorMatch, load_ror, match_ror
 
 logging.basicConfig(
@@ -17,6 +23,11 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s - %(message)s",
 )
 LOGGER = logging.getLogger("gov-affiliation-classifier")
+
+# Control flag for individual fallback processing
+# Default: False for production runs (faster, no reprocessing)
+# Set to True for debugging to enable individual reprocessing on technical errors
+ENABLE_INDIVIDUAL_FALLBACK = False
 
 
 def _parse_args() -> argparse.Namespace:
@@ -37,6 +48,11 @@ def _parse_args() -> argparse.Namespace:
         "--ror-path",
         default="v1.74-2025-11-24-ror-data/v1.74-2025-11-24-ror-data.json",
         help="Path to ROR JSON dump file (default: v1.74-2025-11-24-ror-data/v1.74-2025-11-24-ror-data.json)",
+    )
+    parser.add_argument(
+        "--enable-individual-fallback",
+        action="store_true",
+        help="Enable individual reprocessing on technical errors (slower, for debugging only)",
     )
     return parser.parse_args()
 
@@ -95,6 +111,91 @@ def _attach_ror_fields(result: Dict[str, Any], ror_match: Optional[RorMatch]) ->
         result["suggested_org_type_from_ror"] = None
 
     return result
+
+
+def _ensure_no_nan(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Replace any remaining NaN values in analytical fields with 'unknown' or appropriate defaults.
+    This is a safety net to ensure no NaN values are written to the CSV.
+    """
+    analytical_fields = [
+        "org_type",
+        "gov_level",
+        "gov_local_type",
+        "mission_research_category",
+        "mission_research",
+    ]
+    
+    for field in analytical_fields:
+        if field in df.columns:
+            nan_count = df[field].isna().sum()
+            if nan_count > 0:
+                LOGGER.warning(
+                    "Found %d NaN values in '%s'. Replacing with 'unknown'.",
+                    nan_count,
+                    field
+                )
+                if field == "mission_research":
+                    # mission_research should be 0 or 1, use 0 for unknown
+                    df[field] = df[field].fillna(0)
+                else:
+                    df[field] = df[field].fillna("unknown")
+    
+    return df
+
+
+def _merge_results_by_afid(results_list: List[Tuple[int, Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """
+    Merge results by afid, prioritizing complete results over those with 'unknown' values.
+    
+    Priority order:
+    1. Complete result (no 'unknown' in analytical fields)
+    2. Result with some 'unknown' values
+    3. Empty/technical result (should not exist)
+    
+    If multiple complete results exist for same afid, use the last one (most recent).
+    """
+    from collections import defaultdict
+    
+    # Group by afid
+    afid_groups: Dict[str, List[Tuple[int, Dict[str, Any]]]] = defaultdict(list)
+    for idx, result_dict in results_list:
+        afid = result_dict.get("afid")
+        if afid:
+            afid_groups[str(afid)].append((idx, result_dict))
+    
+    merged_results = []
+    for afid, group in afid_groups.items():
+        if len(group) == 1:
+            # Single result, use it
+            merged_results.append((group[0][0], group[0][1]))
+        else:
+            # Multiple results, select best one
+            # Score: count of non-unknown values in analytical fields
+            analytical_fields = ["org_type", "gov_level", "gov_local_type", "mission_research_category"]
+            
+            def score_result(result_dict: Dict[str, Any]) -> int:
+                score = 0
+                for field in analytical_fields:
+                    value = result_dict.get(field)
+                    if value and value != "unknown" and value != "non_applicable":
+                        score += 1
+                return score
+            
+            # Sort by score (descending), then by index (descending) to prefer most recent
+            sorted_group = sorted(group, key=lambda x: (score_result(x[1]), -x[0]), reverse=True)
+            best_result = sorted_group[0]
+            merged_results.append((best_result[0], best_result[1]))
+            
+            if len(group) > 1:
+                LOGGER.debug(
+                    "Merged %d results for afid '%s', selected result with score %d",
+                    len(group),
+                    afid,
+                    score_result(best_result[1])
+                )
+    
+    return merged_results
 
 
 def _process_batch(
@@ -189,41 +290,97 @@ def _process_batch(
                     results.append((original_item["original_idx"], result_dict))
                 else:
                     LOGGER.warning("Could not find original item for LLM result id '%s'", result_id)
-        except LMStudioError as err:
-            LOGGER.error("Batch LLM call failed: %s. Processing items individually.", err)
-            # Fallback: process individually
-            for item in llm_items:
-                try:
-                    result = classify_affiliation(
-                        item["affiliation"],
-                        item["country_code"] or "",
-                        ror_match=item.get("ror_match"),
-                    )
-                    result_dict = _attach_ror_fields(result, item.get("ror_match"))
-                    result_dict["afid"] = item["id"]
-                    results.append((item["original_idx"], result_dict))
-                except LMStudioError as err2:
-                    LOGGER.error("Individual LLM call also failed for '%s': %s", item["affiliation"], err2)
-                    error_result = {
+        except Exception as err:
+            is_technical = _is_technical_error(err)
+            if is_technical:
+                LOGGER.error(
+                    "Batch LLM call failed with technical error: %s. Error type: %s",
+                    err,
+                    type(err).__name__
+                )
+            else:
+                LOGGER.warning(
+                    "Batch LLM call failed with semantic/parsing issue: %s. Using 'unknown' values.",
+                    err
+                )
+            
+            # Only reprocess individually if it's a technical error AND fallback is enabled
+            if is_technical and ENABLE_INDIVIDUAL_FALLBACK:
+                LOGGER.info("Individual fallback enabled. Reprocessing items individually.")
+                for item in llm_items:
+                    try:
+                        result = classify_affiliation(
+                            item["affiliation"],
+                            item["country_code"] or "",
+                            ror_match=item.get("ror_match"),
+                        )
+                        result_dict = _attach_ror_fields(result, item.get("ror_match"))
+                        result_dict["afid"] = item["id"]
+                        results.append((item["original_idx"], result_dict))
+                    except Exception as err2:
+                        is_technical_2 = _is_technical_error(err2)
+                        if is_technical_2:
+                            LOGGER.error(
+                                "Individual LLM call also failed with technical error for '%s': %s",
+                                item["affiliation"],
+                                err2
+                            )
+                        else:
+                            LOGGER.warning(
+                                "Individual LLM call failed with semantic issue for '%s': %s",
+                                item["affiliation"],
+                                err2
+                            )
+                        # Create result with "unknown" values (not None)
+                        error_result = {
+                            "afid": item["id"],
+                            "org_type": "unknown",
+                            "gov_level": "unknown",
+                            "gov_local_type": "unknown",
+                            "mission_research_category": "unknown",
+                            "mission_research": 0,
+                            "confidence_org_type": None,
+                            "confidence_gov_level": None,
+                            "confidence_mission_research": None,
+                            "rationale": f"Error: {err2}",
+                        }
+                        result_dict = _attach_ror_fields(error_result, item.get("ror_match"))
+                        results.append((item["original_idx"], result_dict))
+            else:
+                # Fallback disabled or non-technical error: mark all items as "unknown"
+                LOGGER.info(
+                    "Individual fallback disabled or non-technical error. Marking %d items as 'unknown'.",
+                    len(llm_items)
+                )
+                for item in llm_items:
+                    unknown_result = {
                         "afid": item["id"],
-                        "org_type": None,
-                        "gov_level": None,
-                        "gov_local_type": None,
-                        "mission_research_category": None,
-                        "mission_research": None,
+                        "org_type": "unknown",
+                        "gov_level": "unknown",
+                        "gov_local_type": "unknown",
+                        "mission_research_category": "unknown",
+                        "mission_research": 0,
                         "confidence_org_type": None,
                         "confidence_gov_level": None,
                         "confidence_mission_research": None,
-                        "rationale": f"Error: {err2}",
+                        "rationale": f"Batch error: {err}",
                     }
-                    result_dict = _attach_ror_fields(error_result, item.get("ror_match"))
+                    result_dict = _attach_ror_fields(unknown_result, item.get("ror_match"))
                     results.append((item["original_idx"], result_dict))
     
     return results, rule_based_count, 1 if llm_items else 0
 
 
 def main() -> None:
+    global ENABLE_INDIVIDUAL_FALLBACK
     args = _parse_args()
+    
+    # Set global flag from CLI argument
+    ENABLE_INDIVIDUAL_FALLBACK = args.enable_individual_fallback
+    if ENABLE_INDIVIDUAL_FALLBACK:
+        LOGGER.info("Individual fallback ENABLED (debugging mode - slower)")
+    else:
+        LOGGER.info("Individual fallback DISABLED (production mode - faster)")
 
     LOGGER.info("Reading input CSV: %s", args.input)
     df = pd.read_csv(args.input)
@@ -249,7 +406,7 @@ def main() -> None:
     ror_cache: Dict[Tuple[str, Optional[str]], Optional[RorMatch]] = {}
     
     # Process in batches
-    batch_size = 15
+    batch_size = 8
     all_results = []
     total_rule_based = 0
     total_llm_batches = 0
@@ -274,19 +431,13 @@ def main() -> None:
         total_llm_batches,
     )
     
-    # Sort results by original index and convert to DataFrame
-    all_results.sort(key=lambda x: x[0])  # Sort by original index
-    classification_results = [result[1] for result in all_results]
+    # Merge results by afid with safe deduplication (prioritize complete results)
+    merged_results = _merge_results_by_afid(all_results)
+    
+    # Sort merged results by original index and convert to DataFrame
+    merged_results.sort(key=lambda x: x[0])  # Sort by original index
+    classification_results = [result[1] for result in merged_results]
     results = pd.DataFrame(classification_results)
-
-    # Check for duplicate afids and handle them (keep the last occurrence)
-    if results["afid"].duplicated().any():
-        duplicate_count = results["afid"].duplicated().sum()
-        LOGGER.warning(
-            "Found %d duplicate afid(s) in results. Keeping the last occurrence for each afid.",
-            duplicate_count
-        )
-        results = results.drop_duplicates(subset=["afid"], keep="last")
 
     # Merge results back to original dataframe by afid
     results_with_afid = results.set_index("afid")
@@ -317,88 +468,8 @@ def main() -> None:
     df["ror_match_score"] = df["afid"].map(results_with_afid["ror_match_score"])
     df["suggested_org_type_from_ror"] = df["afid"].map(results_with_afid["suggested_org_type_from_ror"])
 
-    # Validate for NaN in mission_research_category or mission_research before writing CSV
-    nan_mask = df["mission_research_category"].isna() | df["mission_research"].isna()
-    if nan_mask.any():
-        nan_count = nan_mask.sum()
-        LOGGER.warning(
-            "Found %d row(s) with NaN in mission_research_category or mission_research. Reprocessing individually.",
-            nan_count
-        )
-        
-        # Get rows with NaN and reprocess them
-        nan_rows = df[nan_mask].copy()
-        ror_cache: Dict[Tuple[str, Optional[str]], Optional[RorMatch]] = {}
-        
-        for idx, row in nan_rows.iterrows():
-            affiliation = str(row.get("affiliation", ""))
-            country_code = str(row.get("country_code", ""))
-            afid = row.get("afid")
-            
-            # Check ROR cache or match ROR
-            cache_key = (affiliation, country_code if country_code else None)
-            if cache_key in ror_cache:
-                ror_match = ror_cache[cache_key]
-            else:
-                ror_match = None
-                if ror_available:
-                    try:
-                        ror_match = match_ror(affiliation, country_code if country_code else None)
-                    except Exception as err:
-                        LOGGER.debug("ROR matching failed for '%s': %s", affiliation, err)
-                ror_cache[cache_key] = ror_match
-            
-            # Reprocess individually
-            try:
-                result = classify_affiliation(affiliation, country_code, ror_match=ror_match)
-                result_dict = _attach_ror_fields(result, ror_match)
-                
-                # Update the row in the dataframe
-                df.loc[idx, "org_type"] = result_dict.get("org_type")
-                df.loc[idx, "gov_level"] = result_dict.get("gov_level")
-                df.loc[idx, "gov_local_type"] = result_dict.get("gov_local_type")
-                df.loc[idx, "mission_research_category"] = result_dict.get("mission_research_category")
-                df.loc[idx, "mission_research"] = result_dict.get("mission_research")
-                df.loc[idx, "confidence_org_type"] = result_dict.get("confidence_org_type")
-                df.loc[idx, "confidence_gov_level"] = result_dict.get("confidence_gov_level")
-                df.loc[idx, "confidence_mission_research"] = result_dict.get("confidence_mission_research")
-                df.loc[idx, "rationale"] = result_dict.get("rationale")
-                
-                # Update ROR fields
-                if ror_match is not None:
-                    df.loc[idx, "ror_id"] = ror_match.ror_id
-                    df.loc[idx, "ror_name"] = ror_match.ror_name
-                    df.loc[idx, "ror_types"] = ", ".join(ror_match.ror_types) if ror_match.ror_types else None
-                    df.loc[idx, "ror_country_code"] = ror_match.ror_country_code
-                    df.loc[idx, "ror_state"] = ror_match.ror_state
-                    df.loc[idx, "ror_city"] = ror_match.ror_city
-                    df.loc[idx, "ror_domains"] = ", ".join(ror_match.ror_domains) if ror_match.ror_domains else None
-                    df.loc[idx, "ror_match_score"] = ror_match.match_score
-                    df.loc[idx, "suggested_org_type_from_ror"] = ror_match.suggested_org_type_from_ror
-                else:
-                    df.loc[idx, "ror_id"] = None
-                    df.loc[idx, "ror_name"] = None
-                    df.loc[idx, "ror_types"] = None
-                    df.loc[idx, "ror_country_code"] = None
-                    df.loc[idx, "ror_state"] = None
-                    df.loc[idx, "ror_city"] = None
-                    df.loc[idx, "ror_domains"] = None
-                    df.loc[idx, "ror_match_score"] = None
-                    df.loc[idx, "suggested_org_type_from_ror"] = None
-                
-                LOGGER.info("Successfully reprocessed afid '%s'", afid)
-            except LMStudioError as err3:
-                LOGGER.error("Failed to reprocess afid '%s' individually: %s", afid, err3)
-                # Keep the NaN values - they will be written to CSV as NaN
-
-    # Final validation: check if any NaN remain
-    final_nan_mask = df["mission_research_category"].isna() | df["mission_research"].isna()
-    if final_nan_mask.any():
-        final_nan_count = final_nan_mask.sum()
-        LOGGER.warning(
-            "After reprocessing, %d row(s) still have NaN in mission_research_category or mission_research.",
-            final_nan_count
-        )
+    # Ensure no NaN values remain in analytical fields (safety net)
+    df = _ensure_no_nan(df)
 
     # Remove columns that are no longer used analytically before writing CSV
     columns_to_drop = [
