@@ -3,7 +3,7 @@
 A Python utility for classifying institutional affiliations using a hybrid approach combining:
 - **ROR (Research Organization Registry)** knowledge base for fast matching
 - **Rule-based classification** for clear cases (universities, funders, teaching hospitals)
-- **LM Studio** (local LLM) for complex or ambiguous cases
+- **LLM classification** for complex or ambiguous cases, via **Local** (LM Studio) or **Cloud** (Google Gemini) backends
 
 The classifier determines:
 - Organization type (`org_type`)
@@ -13,6 +13,18 @@ The classifier determines:
 - Research mission binary flag (`mission_research`)
 
 **Note:** This tool is designed for research analysis and does not reproduce official administrative classifications.
+
+## Backends
+
+The classifier supports two backends; choose one at runtime (CLI or Streamlit):
+
+| Backend | Description | Use case |
+|--------|-------------|----------|
+| **Local (LM Studio)** | OpenAI-compatible API (e.g. LM Studio). Uses `openai` client with `base_url` and optional `model_name`. | Private, offline, or custom models. |
+| **Nube (Gemini)** | Google Gemini API via direct HTTP (`requests`). URL: `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`. | Google AI Studio; models such as `gemini-2.0-flash-lite`. |
+
+- **Rule of thumb:** Try rule-based classification first; if it returns no result, call the selected LLM backend.
+- No API keys are hardcoded: use config, CLI args, or environment variables (`GEMINI_API_KEY`, `LM_STUDIO_BASE_URL`, etc.).
 
 ## Features
 
@@ -24,9 +36,12 @@ The system uses a two-stage approach for efficiency:
    - Research funding organizations (Enablers)
    - Teaching hospitals with academic links
 
-2. **LLM classification** (when needed): For ambiguous cases, complex organizations, or when ROR data is unavailable.
+2. **LLM classification** (when needed): For ambiguous cases, complex organizations, or when ROR data is unavailable. Uses either Local (LM Studio) or Cloud (Gemini) backend.
 
-3. **Prompt & parsing safeguards:** The prompt now enforces ROR-aligned research mission (mission_research=1 when a valid ROR match exists and mission_research_category limited to AcademicResearch/AppliedResearch/Enabler) and the client extracts JSON robustly even if the model wraps it in ```json fences.
+3. **Robust JSON extraction:** The prompt asks the model to return only a valid JSON object. The client uses a robust extractor that:
+   - Strips Markdown fences (e.g. `` ```json ... ``` ``)
+   - Finds the first `{ ... }` or `[ ... ]` by matching braces/brackets so that surrounding text or extra text does not break parsing
+   - Falls back to regex if brace matching fails, and raises a clear error if no JSON is found
 
 ### 📊 Output Fields
 
@@ -42,24 +57,12 @@ The classifier produces a CSV with the following fields:
   - `0` if category is `NonResearch` or `Enabler`
 
 **ROR enrichment fields:**
-- `ror_id`: ROR identifier if matched
-- `ror_name`: Official ROR name
-- `ror_types`: Comma-separated list of ROR types
-- `ror_country_code`: Country code from ROR
-- `ror_state`: State/region from ROR (if available)
-- `ror_city`: City from ROR (if available)
-- `ror_match_score`: Match confidence score (0.0-1.0)
-- `suggested_org_type_from_ror`: Suggested organization type based on ROR types
+- `ror_id`, `ror_name`, `ror_types`, `ror_country_code`, `ror_state`, `ror_city`, `ror_match_score`, `suggested_org_type_from_ror`
 
 ## Current Scope (v1.0)
 
-### Geographic Scope
-
-In v1.0, `gov_level` is primarily validated for U.S. affiliations (federal / state / local). For other countries, values may be `unknown` or `non_applicable`. The design is extensible to other countries, but administrative taxonomies are not yet country-specific.
-
-### Academic Use
-
-**Important:** This tool is designed for **research analysis purposes** and does not aim to reproduce official administrative classifications. The taxonomy and classifications are intended for academic and research use, not for official government or legal purposes.
+- **Geographic:** `gov_level` is primarily validated for U.S. affiliations; for other countries, values may be `unknown` or `non_applicable`.
+- **Academic use:** This tool is for **research analysis** and does not aim to reproduce official administrative classifications.
 
 ## Installation
 
@@ -68,178 +71,100 @@ In v1.0, `gov_level` is primarily validated for U.S. affiliations (federal / sta
    pip install -r requirements.txt
    ```
 
-2. Ensure you have:
-   - A local LM Studio instance running with an OpenAI-compatible API
-   - ROR dump file (default: `v1.74-2025-11-24-ror-data/v1.74-2025-11-24-ror-data.json`)
+2. Main dependencies (see `requirements.txt` for versions):
+   - **pandas** – CSV processing
+   - **requests** – HTTP client (used for Gemini API and general requests)
+   - **openai** – OpenAI-compatible client (used for Local / LM Studio backend)
+   - **python-dotenv** – Environment variable management
+   - **rapidfuzz** – Fuzzy matching for ROR
+   - **streamlit** – Web UI (optional, for `app.py`)
+   - **pydantic** – Schema validation (taxonomy)
+
+3. Ensure you have:
+   - For **Local:** An LM Studio (or OpenAI-compatible) server and, if needed, a ROR dump file.
+   - For **Gemini:** A Google AI Studio API key (set `GEMINI_API_KEY` or pass via config/UI). No API keys are hardcoded in the codebase.
+
+**Nota (modo local):** Para el modo local, es necesario cargar el modelo en LM Studio y activar el servidor en el puerto 1234.
 
 ## Usage
 
-### Basic Usage
+### CLI
 
+**Local backend (default):**
 ```bash
 python main.py --input input.csv --output output.csv
 ```
 
-### With Custom ROR Path
+**Gemini backend:**
+```bash
+python main.py --input input.csv --output output.csv --backend gemini --gemini-api-key YOUR_KEY
+```
+(Or set `GEMINI_API_KEY` in the environment and omit `--gemini-api-key`.)
 
+**Custom ROR path:**
 ```bash
 python main.py --input input.csv --output output.csv --ror-path path/to/ror-data.json
 ```
 
-### Input CSV Format
+### Streamlit UI
 
-The input CSV must contain the following columns:
-- `afid`: Unique identifier for each affiliation
-- `affiliation`: The affiliation string to classify
-- `country_code`: ISO country code (e.g., `usa`, `gbr`, `fra`)
-
-Example:
-```csv
-afid,affiliation,country_code
-1,"Harvard University",usa
-2,"National Science Foundation",usa
-3,"Ministry of Health",fra
+```bash
+streamlit run app.py
 ```
 
-### Output CSV Format
+In the sidebar: choose **Local** or **Gemini**, set API key (Gemini) or base URL (Local), optional model name and ROR path. Upload a CSV, run classification, and download the result.
 
-The output CSV contains all input columns plus the classification and ROR enrichment fields listed above.
+### Input CSV Format
+
+Required columns: `afid`, `affiliation`, `country_code` (e.g. `usa`, `gbr`, `fra`).
 
 ## Configuration
 
-Environment variables (optional) may be defined in a `.env` file:
+Environment variables (optional, e.g. in `.env`):
 
-- `LM_STUDIO_BASE_URL` (default: `http://localhost:1234/v1/chat/completions`)
-- `LM_STUDIO_MODEL_NAME` (default: `local-model`)
-- `LM_STUDIO_TIMEOUT` in seconds (default: `60`)
+- **Local:** `LM_STUDIO_BASE_URL` (default: `http://localhost:1234/v1`), `LM_STUDIO_MODEL_NAME`, `LM_STUDIO_TIMEOUT`
+- **Gemini:** `GEMINI_API_KEY` (required for Gemini backend if not passed via CLI/UI)
+
+No API keys or secrets are hardcoded; always use config, CLI, or environment.
+
+## Troubleshooting
+
+### Error 429 (Google / Gemini – Cuotas)
+
+When using the **Gemini** backend, Google may return **429 Too Many Requests** (rate limit / quota exceeded).
+
+- **Reduce request rate:** The Gemini client uses a **4-second delay** (`time.sleep(4)`) between each individual request to stay under free-tier limits.
+- **Use a lighter model:** The default model is `gemini-2.0-flash-lite`, which typically has a more generous free quota. You can change it in the Streamlit sidebar or via config/CLI.
+- **Check quota:** In [Google AI Studio](https://aistudio.google.com/) check your project’s quotas and limits. If you hit “limit: 0”, wait or switch to a model with available quota.
+- **Retries:** The client retries on transient failures; combined with the 4 s delay, this helps with occasional 429s.
+
+### Local (LM Studio)
+
+- Ensure LM Studio is running and the server URL matches `LM_STUDIO_BASE_URL`.
+- If the model name is not the default, set `LM_STUDIO_MODEL_NAME` or pass it via CLI/UI.
+
+### JSON parsing errors
+
+- The robust JSON extractor in `lm_client.py` (`_extract_json_object`) handles fences and surrounding text. If you still see parsing errors, check the model output (e.g. via logs); the prompt instructs the model to return only a valid JSON object.
 
 ## Architecture
 
-### Components
+- **`ror_knowledge.py`:** ROR index and matching.
+- **`lm_client.py`:** Rule-based classifier, `LLMBackend` (abstract), `GeminiBackend` (HTTP with `requests`), `LocalBackend` (OpenAI client), robust JSON extraction, normalization.
+- **`main.py`:** CLI orchestration; selects backend and runs the classification pipeline.
+- **`app.py`:** Streamlit UI; backend selection and configuration in the sidebar.
 
-1. **`ror_knowledge.py`**: ROR knowledge base module
-   - Loads and indexes ROR dump
-   - Provides fuzzy matching against ROR organizations
-   - Suggests organization types based on ROR metadata
-
-2. **`lm_client.py`**: LLM client and rule-based classifier
-   - `try_rule_based_classification()`: Fast-track classification for clear cases
-   - `classify_affiliation()`: LLM-based classification for complex cases
-   - System prompt with taxonomy definitions
-
-3. **`main.py`**: Main orchestration script
-   - Reads input CSV
-   - Loads ROR knowledge base
-   - Applies rule-based classification when possible
-   - Falls back to LLM when needed
-   - Writes enriched output CSV
-
-### Classification Flow
-
-```
-For each affiliation:
-  1. Match against ROR knowledge base
-  2. Try rule-based classification:
-     - If clear match → use rule-based result (skip LLM)
-     - If ambiguous → proceed to step 3
-  3. Call LLM with ROR context (if available)
-  4. Validate and normalize LLM response
-  5. Write results to CSV
-```
-
-### Rule-Based Classification Rules
-
-The system applies conservative rules only for clear cases:
-
-**Rule A - Universities:**
-- ROR type includes `education`
-- Name contains university indicators (university, college, institute of technology, etc.)
-- Excludes consortia and associations
-- Result: `org_type=university`, `mission_research_category=AcademicResearch`
-
-**Rule B - Funders:**
-- ROR type includes `funder`
-- Name contains funding indicators (foundation, research council, etc.)
-- Determines government vs NGO based on name patterns
-- Result: `mission_research_category=Enabler`
-
-**Rule C - Teaching Hospitals:**
-- ROR type includes `healthcare`
-- Name contains academic hospital indicators (university hospital, academic medical center, etc.)
-- Result: `org_type=hospital`, `mission_research_category=AcademicResearch`
-
-**Important:** If any rule is ambiguous or doesn't apply, the system defaults to LLM classification.
-
-## Research Mission Categories
-
-The classifier uses a four-category taxonomy for research mission:
-
-- **`NonResearch`** (code 0): Organizations with no explicit research mission
-  - General-purpose government agencies, administrative offices
-  - Hospitals/clinics without research role
-  - Service providers implementing policy
-
-- **`Enabler`** (code 1): Organizations that enable or fund research but don't primarily produce it
-  - Research funding agencies (NSF, NIH HQ, research councils)
-  - Foundations and philanthropies that fund research
-  - University grant offices
-
-- **`AppliedResearch`** (code 2): Organizations conducting mission-oriented or applied research
-  - Government labs (EPA, USGS, NOAA research centers)
-  - Public health services with analytic capabilities
-  - R&D units in agencies or companies
-
-- **`AcademicResearch`** (code 3): Organizations where research is a central formal mission
-  - Universities and higher education institutions
-  - Research institutes and centers
-  - National labs with strong scientific mission
-  - Academic medical centers linked to universities
-
-The binary `mission_research` flag is automatically derived:
-- `1` for `AppliedResearch` or `AcademicResearch`
-- `0` for `NonResearch` or `Enabler`
-
-**ROR prior (prompt rule):** when a valid ROR record is present, the prompt instructs the model to treat the organization as part of the research ecosystem, set `mission_research` = 1, and pick `mission_research_category` from `AcademicResearch`, `AppliedResearch`, or `Enabler` according to ROR role cues.
-
-## Performance
-
-The hybrid approach significantly reduces LLM calls:
-- Clear cases (universities, funders, teaching hospitals) are classified instantly via rules
-- Only ambiguous or complex cases require LLM inference
-- Typical reduction: 30-50% fewer LLM calls depending on dataset composition
-
-The system logs statistics:
-```
-Classification complete: 45 rule-based, 55 LLM calls
-```
-
-## Performance and Limitations
-
-The classifier is designed for **local execution** with LM Studio. When running on CPU-only local LLMs, some complex batches may take several minutes to complete. The pipeline is designed to favor conservative inference and fallback mechanisms over aggressive parallelization.
-
-**Important considerations:**
-- In CPU-only setups, long-running batch inference may be slow
-- Complex batches with many ambiguous cases may require several minutes per batch
-- The system prioritizes robustness and correctness over speed
-- Timeouts are set conservatively to accommodate slower inference on CPU
-
-## Error Handling
-
-- If ROR dump fails to load, the system continues without ROR matching
-- If ROR matching fails for a specific affiliation, it falls back to LLM
-- If LLM call fails, classification fields are set to `None` for that row
-- All errors are logged for debugging
+Classification flow: ROR match → rule-based classification → if no result, call selected LLM backend → normalize and validate response (including robust JSON extraction) → write CSV.
 
 ## Dependencies
 
-- `pandas>=2.0`: CSV processing
-- `requests>=2.31`: HTTP client for LM Studio API
-- `python-dotenv>=1.0`: Environment variable management
-- `rapidfuzz>=3.0`: Fuzzy string matching for ROR
-
-## Future Improvements
-
-Future versions may include checkpointing and resume capabilities for very large datasets, allowing the pipeline to recover from interruptions and continue processing from the last successful batch.
+- `pandas>=2.0` – CSV processing
+- `requests>=2.31` – HTTP (Gemini API and general)
+- `openai>=1.0.0` – OpenAI-compatible API (Local / LM Studio)
+- `python-dotenv>=1.0` – Env loading
+- `rapidfuzz>=3.0` – ROR fuzzy matching
+- `streamlit>=1.28` – Web UI
+- `pydantic>=2.0` – Schemas
 
 ## License
 

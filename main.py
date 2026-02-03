@@ -448,33 +448,37 @@ def run_classification_pipeline(
     )
 
     merged_results = _merge_results_by_afid(all_results)
-    merged_results.sort(key=lambda x: x[0])
     classification_results = [result[1] for result in merged_results]
-    results = pd.DataFrame(classification_results)
 
-    results_with_afid = results.set_index("afid")
-    df["org_type"] = df["afid"].map(results_with_afid["org_type"])
-    df["gov_level"] = df["afid"].map(results_with_afid["gov_level"])
-    df["gov_local_type"] = df["afid"].map(results_with_afid["gov_local_type"])
-    df["mission_research_category"] = df["afid"].map(results_with_afid["mission_research_category"])
-    df["mission_research"] = df["afid"].map(results_with_afid["mission_research"])
-    df["confidence_org_type"] = df["afid"].map(results_with_afid["confidence_org_type"])
-    df["confidence_gov_level"] = df["afid"].map(results_with_afid["confidence_gov_level"])
-    df["confidence_mission_research"] = df["afid"].map(results_with_afid["confidence_mission_research"])
-    df["rationale"] = df["afid"].map(results_with_afid["rationale"])
-    df["ror_id"] = df["afid"].map(results_with_afid["ror_id"])
-    df["ror_name"] = df["afid"].map(results_with_afid["ror_name"])
-    df["ror_types"] = df["afid"].map(results_with_afid["ror_types"]).apply(
-        lambda x: ", ".join(x) if isinstance(x, list) else (x or "")
-    )
-    df["ror_country_code"] = df["afid"].map(results_with_afid["ror_country_code"])
-    df["ror_state"] = df["afid"].map(results_with_afid["ror_state"])
-    df["ror_city"] = df["afid"].map(results_with_afid["ror_city"])
-    df["ror_domains"] = df["afid"].map(results_with_afid["ror_domains"]).apply(
-        lambda x: ", ".join(x) if isinstance(x, list) else (x or "")
-    )
-    df["ror_match_score"] = df["afid"].map(results_with_afid["ror_match_score"])
-    df["suggested_org_type_from_ror"] = df["afid"].map(results_with_afid["suggested_org_type_from_ror"])
+    # Mapeo solo por ID: lookup por afid (string), sin depender del orden secuencial
+    lookup = {str(r["afid"]): r for r in classification_results}
+    df["afid"] = df["afid"].astype(str)
+    print(f"IDs mapeados: {list(lookup.keys())}")
+
+    def _get(row_id: str, key: str, default: Any = "unknown") -> Any:
+        return lookup.get(row_id, {}).get(key, default)
+
+    df["org_type"] = df["afid"].map(lambda x: _get(x, "org_type", "unknown"))
+    df["gov_level"] = df["afid"].map(lambda x: _get(x, "gov_level", "unknown"))
+    df["gov_local_type"] = df["afid"].map(lambda x: _get(x, "gov_local_type", "unknown"))
+    df["mission_research_category"] = df["afid"].map(lambda x: _get(x, "mission_research_category", "unknown"))
+    df["mission_research"] = df["afid"].map(lambda x: _get(x, "mission_research", 0))
+    df["confidence_org_type"] = df["afid"].map(lambda x: _get(x, "confidence_org_type"))
+    df["confidence_gov_level"] = df["afid"].map(lambda x: _get(x, "confidence_gov_level"))
+    df["confidence_mission_research"] = df["afid"].map(lambda x: _get(x, "confidence_mission_research"))
+    df["rationale"] = df["afid"].map(lambda x: _get(x, "rationale", ""))
+    df["ror_id"] = df["afid"].map(lambda x: _get(x, "ror_id"))
+    df["ror_name"] = df["afid"].map(lambda x: _get(x, "ror_name"))
+    def _ror_list_to_str(v: Any) -> str:
+        return ", ".join(v) if isinstance(v, list) else (v or "")
+
+    df["ror_types"] = df["afid"].map(lambda x: _ror_list_to_str(_get(x, "ror_types")))
+    df["ror_country_code"] = df["afid"].map(lambda x: _get(x, "ror_country_code"))
+    df["ror_state"] = df["afid"].map(lambda x: _get(x, "ror_state"))
+    df["ror_city"] = df["afid"].map(lambda x: _get(x, "ror_city"))
+    df["ror_domains"] = df["afid"].map(lambda x: _ror_list_to_str(_get(x, "ror_domains")))
+    df["ror_match_score"] = df["afid"].map(lambda x: _get(x, "ror_match_score"))
+    df["suggested_org_type_from_ror"] = df["afid"].map(lambda x: _get(x, "suggested_org_type_from_ror"))
     df = _ensure_no_nan(df)
 
     columns_to_drop = [

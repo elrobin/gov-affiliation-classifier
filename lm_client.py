@@ -1,13 +1,12 @@
 """
 Clientes para clasificación de afiliaciones mediante LLMs.
 
-Arquitectura híbrida:
 - LLMBackend: clase abstracta.
-- GeminiBackend: Google Gemini (API) con salida JSON estructurada (response_schema).
-- LocalBackend: LM Studio / API compatible con OpenAI, con reintentos para JSON.
+- GeminiBackend: Gemini vía HTTP directo (requests), formato Google generateContent.
+- LocalBackend: LM Studio vía librería openai (chat completions); 100% compatible, sin requests.
 
-Regla de oro: primero se intenta try_rule_based_classification; si devuelve None,
-se usa el backend LLM seleccionado.
+classify_affiliation / classify_affiliations_batch usan el backend seleccionado (get_classifier + set_default_backend).
+Regla de oro: primero try_rule_based_classification; si devuelve None, se usa el LLM.
 """
 from __future__ import annotations
 
@@ -19,6 +18,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import logging
+import requests
 from dotenv import load_dotenv
 
 try:
@@ -182,6 +182,80 @@ Return ONLY a JSON object with all required keys:
 - "rationale"
 
 "rationale" MUST be a string (can be short). No extra text, no explanations outside the JSON.
+
+# 7. EXAMPLES (COMPLEX CASES)
+
+Example 1: Government department (administrative function)
+Affiliation: "Department of Energy"
+Country: "US"
+→ government, NonResearch
+
+{
+  "org_type": "government",
+  "gov_level": "federal",
+  "gov_local_type": "non_applicable",
+  "mission_research_category": "NonResearch",
+  "mission_research": 0,
+  "rationale": "Federal government department with administrative and policy functions, not primarily a research organization."
+}
+
+Example 2: Government department (administrative function)
+Affiliation: "Department of Education"
+Country: "US"
+→ government, NonResearch
+
+{
+  "org_type": "government",
+  "gov_level": "federal",
+  "gov_local_type": "non_applicable",
+  "mission_research_category": "NonResearch",
+  "mission_research": 0,
+  "rationale": "Federal government department with administrative and policy functions, not primarily a research organization."
+}
+
+Example 3: Academic department (academic discipline)
+Affiliation: "Department of Philosophy"
+Country: "US"
+→ university, AcademicResearch
+
+{
+  "org_type": "university",
+  "gov_level": "non_applicable",
+  "gov_local_type": "non_applicable",
+  "mission_research_category": "AcademicResearch",
+  "mission_research": 1,
+  "rationale": "Academic department of an academic discipline, performing teaching and research activities."
+}
+
+Example 4: Academic department (academic discipline)
+Affiliation: "Department of Educational Sciences"
+Country: "US"
+→ university, AcademicResearch
+
+{
+  "org_type": "university",
+  "gov_level": "non_applicable",
+  "gov_local_type": "non_applicable",
+  "mission_research_category": "AcademicResearch",
+  "mission_research": 1,
+  "rationale": "Academic department of an academic discipline, performing teaching and research activities."
+}
+
+Example 5: Academic department (academic discipline)
+Affiliation: "Department of Computer Science"
+Country: "US"
+→ university, AcademicResearch
+
+{
+  "org_type": "university",
+  "gov_level": "non_applicable",
+  "gov_local_type": "non_applicable",
+  "mission_research_category": "AcademicResearch",
+  "mission_research": 1,
+  "rationale": "Academic department of an academic discipline, performing teaching and research activities."
+}
+
+IMPORTANT: Return ONLY a valid JSON object. No conversation, no fences.
 """
 
 SYSTEM_PROMPT_BATCH = """\
@@ -209,24 +283,6 @@ Follow the same rules as the single-item classification prompt for each item.
 
 CRITICAL: You MUST return a JSON array, not a single object. The array must have exactly the same length and order as the input.
 """
-
-
-# ---------------------------------------------------------------------------
-# JSON schema para Gemini (response_schema)
-# ---------------------------------------------------------------------------
-
-GEMINI_RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "org_type": {"type": "string", "enum": ["supranational_organization", "government", "university", "research_institute", "company", "ngo", "hospital", "other"]},
-        "gov_level": {"type": "string", "enum": ["federal", "state", "local", "unknown", "non_applicable"]},
-        "gov_local_type": {"type": "string", "enum": ["city", "county", "other_local", "unknown", "non_applicable"]},
-        "mission_research_category": {"type": "string", "enum": ["NonResearch", "Enabler", "AppliedResearch", "AcademicResearch"]},
-        "mission_research": {"type": "integer", "enum": [0, 1]},
-        "rationale": {"type": "string"},
-    },
-    "required": ["org_type", "gov_level", "gov_local_type", "mission_research_category", "mission_research", "rationale"],
-}
 
 
 # ---------------------------------------------------------------------------
@@ -303,27 +359,130 @@ def _normalize_to_unknown(result_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _extract_json_object(text: str) -> str:
-    """Extract the first JSON object or array from a text response, stripping ``` fences."""
-    if not text:
+    """
+    Extrae el primer objeto {} o array [] JSON del texto, aunque haya texto alrededor o cercas ```.
+    Prioriza el carácter que abre primero: si el JSON empieza por [, extrae array; si por {, extrae objeto.
+    Así "[{...}, {...}]" se devuelve completo como array, no solo el primer objeto.
+    """
+    if not text or not text.strip():
         raise ValueError("Empty response from LLM")
 
     cleaned = text.strip()
-    if cleaned.startswith("```"):
+    # Quitar cercas ```json ... ``` o ``` ... ```
+    if "```" in cleaned:
         cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
-        cleaned = re.sub(r"```$", "", cleaned).strip()
+        cleaned = re.sub(r"```\s*$", "", cleaned)
+        cleaned = re.sub(r"```\s*", "\n", cleaned).strip()
 
-    match_arr = re.search(r"\[.*\]", cleaned, flags=re.DOTALL)
-    match_obj = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-    if match_arr:
-        return match_arr.group(0).strip()
-    if match_obj:
-        return match_obj.group(0).strip()
-    return cleaned
+    # Encontrar el primer { o [ para decidir si extraemos objeto o array
+    first_brace = cleaned.find("{")
+    first_bracket = cleaned.find("[")
+
+    def extract_object(start: int) -> str:
+        depth = 0
+        for i in range(start, len(cleaned)):
+            if cleaned[i] == "{":
+                depth += 1
+            elif cleaned[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return cleaned[start : i + 1]
+        match = re.search(r"\{.*\}", cleaned[start:], flags=re.DOTALL)
+        return match.group(0).strip() if match else ""
+
+    def extract_array(start: int) -> str:
+        depth = 0
+        for i in range(start, len(cleaned)):
+            if cleaned[i] == "[":
+                depth += 1
+            elif cleaned[i] == "]":
+                depth -= 1
+                if depth == 0:
+                    return cleaned[start : i + 1]
+        match = re.search(r"\[.*\]", cleaned[start:], flags=re.DOTALL)
+        return match.group(0).strip() if match else ""
+
+    # Si el JSON empieza por [, extraer array (para batch); si por {, extraer objeto
+    if first_bracket != -1 and (first_brace == -1 or first_bracket < first_brace):
+        out = extract_array(first_bracket)
+        if out:
+            return out
+    if first_brace != -1:
+        out = extract_object(first_brace)
+        if out:
+            return out
+    if first_bracket != -1:
+        out = extract_array(first_bracket)
+        if out:
+            return out
+
+    raise ValueError("No JSON object or array found in response")
+
+
+def _normalize_llm_keys(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Map common LLM key variants to canonical keys so we don't get 'unknown' when
+    the model returns e.g. mission_research (string) instead of mission_research_category,
+    or different casing (OrgType, govLevel, etc.).
+    """
+    if not parsed:
+        return parsed
+    canonical = dict(parsed)
+    key_lower = {k.lower().replace("-", "_"): k for k in parsed}
+
+    def get_canonical(*aliases: str) -> Optional[Any]:
+        for a in aliases:
+            al = a.lower().replace("-", "_")
+            if al in key_lower:
+                return parsed.get(key_lower[al])
+        return None
+
+    # org_type
+    v = get_canonical("org_type", "OrgType", "orgType", "organization_type")
+    if v is not None:
+        canonical["org_type"] = v
+
+    # gov_level
+    v = get_canonical("gov_level", "GovLevel", "govLevel", "government_level")
+    if v is not None:
+        canonical["gov_level"] = v
+
+    # gov_local_type
+    v = get_canonical("gov_local_type", "GovLocalType", "govLocalType", "local_type")
+    if v is not None:
+        canonical["gov_local_type"] = v
+
+    # mission_research_category: string (NonResearch, Enabler, AppliedResearch, AcademicResearch)
+    v = get_canonical("mission_research_category", "MissionResearchCategory", "mission_research_category")
+    if v is None:
+        # Some models return category under "mission_research" (string)
+        v = parsed.get("mission_research")
+        if isinstance(v, str) and v in {"NonResearch", "Enabler", "AppliedResearch", "AcademicResearch"}:
+            canonical["mission_research_category"] = v
+    else:
+        canonical["mission_research_category"] = v
+
+    # mission_research: 0 or 1 (do not overwrite with string category)
+    v = get_canonical("mission_research", "MissionResearch", "mission_research_flag")
+    if v is not None:
+        if isinstance(v, (int, float)) and v in (0, 1):
+            canonical["mission_research"] = int(v)
+        elif isinstance(v, bool):
+            canonical["mission_research"] = 1 if v else 0
+        # else: leave as-is; _normalize_to_unknown may infer from category
+
+    # rationale
+    v = get_canonical("rationale", "Rationale", "reason", "explanation")
+    if v is not None:
+        canonical["rationale"] = str(v) if v is not None else ""
+
+    return canonical
 
 
 def _parsed_to_result_dict(parsed: Dict[str, Any]) -> Dict[str, Any]:
     """Convert parsed LLM response to normalized result dict (same shape for all backends)."""
-    parsed = _normalize_to_unknown(parsed.copy())
+    parsed = _normalize_llm_keys(parsed.copy())
+    parsed = _normalize_to_unknown(parsed)
     org_type = parsed.get("org_type")
     if org_type != "government":
         parsed["gov_level"] = "non_applicable"
@@ -457,33 +616,18 @@ class LLMBackend(ABC):
 
 
 class GeminiBackend(LLMBackend):
-    """Backend usando Google Gemini (API) con salida JSON estructurada (response_schema)."""
+    """
+    Backend Gemini vía HTTP directo (requests). Formato Google generateContent;
+    no usa la librería openai. URL y payload bajo control total.
+    """
 
     def __init__(self, config: BackendConfig):
         self.api_key = config.get("api_key") or os.environ.get("GEMINI_API_KEY")
         if not self.api_key:
             raise ValueError("Gemini backend requires api_key in config or GEMINI_API_KEY in environment")
-        self.model_name = config.get("model_name", "gemini-1.5-flash")
-        self._client = None
-
-    def _get_model(self):
-        import google.generativeai as genai
-        genai.configure(api_key=self.api_key)
-        try:
-            config = genai.types.GenerationConfig(
-                temperature=0.0,
-                max_output_tokens=256,
-                response_mime_type="application/json",
-                response_schema=GEMINI_RESPONSE_SCHEMA,
-            )
-        except (TypeError, AttributeError):
-            # Algunas versiones no soportan response_schema; usar solo JSON
-            config = genai.types.GenerationConfig(
-                temperature=0.0,
-                max_output_tokens=256,
-                response_mime_type="application/json",
-            )
-        return genai.GenerativeModel(self.model_name, generation_config=config)
+        # Modelo Lite estable en la API (gemini-2.0-flash-lite)
+        self.model_name = (config.get("model_name") or "gemini-2.0-flash-lite").strip().replace("models/", "")
+        self.max_retries = int(config.get("max_retries", 2))
 
     def classify_affiliation(
         self,
@@ -491,9 +635,11 @@ class GeminiBackend(LLMBackend):
         country_code: str,
         ror_match: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        affiliation = str(affiliation).strip() if affiliation is not None else ""
+        country_code = str(country_code).strip() if country_code is not None else ""
         user_data: Dict[str, Any] = {
-            "affiliation": affiliation.strip(),
-            "country_code": country_code.strip(),
+            "affiliation": affiliation,
+            "country_code": country_code,
         }
         if ror_match is not None and RorMatch is not None:
             user_data["ror_match"] = {
@@ -509,18 +655,32 @@ class GeminiBackend(LLMBackend):
             if getattr(ror_match, "suggested_org_type_from_ror", None):
                 user_data["ror_match"]["suggested_org_type_from_ror"] = ror_match.suggested_org_type_from_ror
 
-        model = self._get_model()
         prompt = f"{SYSTEM_PROMPT}\n\nInput:\n{json.dumps(user_data)}"
-        response = model.generate_content(prompt)
-        text = response.text if hasattr(response, "text") else (response.candidates[0].content.parts[0].text if response.candidates else "")
-        if not text:
-            raise LMStudioError("Gemini returned empty response")
-        try:
-            json_str = _extract_json_object(text)
-            parsed = json.loads(json_str)
-        except (ValueError, json.JSONDecodeError) as e:
-            raise LMStudioError(f"Gemini returned invalid JSON: {e}") from e
-        return _parsed_to_result_dict(parsed)
+        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        # URL: .../v1beta/models/gemini-2.0-flash-lite:generateContent?key=...
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={self.api_key}"
+        headers = {"Content-Type": "application/json"}
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                time.sleep(4)  # Retardo entre peticiones para evitar 429 (límite de cuota)
+                response = requests.post(url, json=payload, headers=headers, timeout=120)
+                if not response.ok:
+                    LOGGER.error("Gemini API error response: %s", response.text)
+                    response.raise_for_status()
+                data = response.json()
+                text = data["candidates"][0]["content"]["parts"][0]["text"]
+                json_str = _extract_json_object(text)
+                parsed = json.loads(json_str)
+                return _parsed_to_result_dict(parsed)
+            except (json.JSONDecodeError, ValueError, KeyError, IndexError, requests.exceptions.RequestException) as e:
+                if attempt < self.max_retries:
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                if hasattr(e, "response") and e.response is not None:
+                    LOGGER.error("Gemini API error body: %s", e.response.text)
+                raise LMStudioError(f"Gemini request or parse failed after {self.max_retries + 1} attempts: {e}") from e
+        raise LMStudioError("Unreachable")
 
     def classify_affiliations_batch(
         self,
@@ -529,69 +689,23 @@ class GeminiBackend(LLMBackend):
     ) -> List[Dict[str, Any]]:
         if not items:
             return []
-
-        batch_data = []
-        for item in items:
-            entry: Dict[str, Any] = {
-                "id": item["id"],
-                "affiliation": str(item["affiliation"]).strip(),
-                "country_code": str(item.get("country_code", "")).strip(),
-            }
-            if "ror_match" in item and item["ror_match"] is not None:
-                ror = item["ror_match"]
-                entry["ror_match"] = {
-                    "ror_id": ror.ror_id,
-                    "ror_name": ror.ror_name,
-                    "ror_types": ror.ror_types,
-                    "ror_country_code": ror.ror_country_code,
-                    "ror_state": ror.ror_state,
-                    "ror_city": ror.ror_city,
-                    "ror_domains": ror.ror_domains,
-                    "match_score": ror.match_score,
-                }
-                if getattr(ror, "suggested_org_type_from_ror", None):
-                    entry["ror_match"]["suggested_org_type_from_ror"] = ror.suggested_org_type_from_ror
-            batch_data.append(entry)
-
-        model = self._get_model()
-        # Gemini with response_schema is single-object; for batch we ask for array in prompt and parse
-        prompt = f"{SYSTEM_PROMPT_BATCH}\n\nInput:\n{json.dumps(batch_data)}"
-        # For batch, we don't use response_schema (array); we use plain JSON and extract
-        import google.generativeai as genai
-        genai.configure(api_key=self.api_key)
-        model_batch = genai.GenerativeModel(
-            self.model_name,
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.0,
-                max_output_tokens=8192,
-                response_mime_type="application/json",
-            ),
-        )
-        response = model_batch.generate_content(prompt)
-        text = response.text if hasattr(response, "text") else (response.candidates[0].content.parts[0].text if response.candidates else "")
-        if not text:
-            raise LMStudioError("Gemini batch returned empty response")
-        json_str = _extract_json_object(text)
-        parsed_array = json.loads(json_str)
-
-        if not isinstance(parsed_array, list):
-            raise LMStudioError(f"Expected JSON array, got {type(parsed_array)}")
-
-        if len(parsed_array) < len(items):
-            parsed_array.extend([{}] * (len(items) - len(parsed_array)))
-        elif len(parsed_array) > len(items):
-            parsed_array = parsed_array[:len(items)]
-
         results: List[Dict[str, Any]] = []
-        for idx, result_item in enumerate(parsed_array):
+        for item in items:
+            affiliation = str(item.get("affiliation", "") or "").strip()
+            country_code = str(item.get("country_code", "") or "").strip()
+            ror_match = item.get("ror_match")
             try:
-                normalized = _parsed_to_result_dict(result_item.copy() if result_item else {})
-                normalized["id"] = items[idx]["id"]
-                results.append(normalized)
-            except Exception as exc:
-                LOGGER.warning("Failed to normalize batch item %d: %s", idx, exc)
+                result = self.classify_affiliation(
+                    affiliation=affiliation,
+                    country_code=country_code,
+                    ror_match=ror_match,
+                )
+                result["id"] = item["id"]
+                results.append(result)
+            except Exception as e:
+                LOGGER.warning("Gemini individual classification failed for id=%s: %s", item.get("id"), e)
                 results.append({
-                    "id": items[idx]["id"],
+                    "id": item["id"],
                     "org_type": "unknown",
                     "gov_level": "unknown",
                     "gov_local_type": "unknown",
@@ -600,13 +714,17 @@ class GeminiBackend(LLMBackend):
                     "confidence_org_type": None,
                     "confidence_gov_level": None,
                     "confidence_mission_research": None,
-                    "rationale": str(exc),
+                    "rationale": f"Error: {e}",
                 })
         return results
 
 
 class LocalBackend(LLMBackend):
-    """Backend OpenAI-compatible (LM Studio, etc.) con reintentos para JSON."""
+    """
+    Backend para LM Studio (o cualquier API compatible con OpenAI).
+    Usa siempre la librería openai: LM Studio es 100% compatible con el cliente OpenAI
+    (chat completions con messages). No usa requests ni formato Google.
+    """
 
     def __init__(self, config: BackendConfig):
         self.base_url = config.get("base_url") or os.environ.get("LM_STUDIO_BASE_URL", "http://localhost:1234/v1")
@@ -624,9 +742,11 @@ class LocalBackend(LLMBackend):
         country_code: str,
         ror_match: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        affiliation = str(affiliation).strip() if affiliation is not None else ""
+        country_code = str(country_code).strip() if country_code is not None else ""
         user_data: Dict[str, Any] = {
-            "affiliation": affiliation.strip(),
-            "country_code": country_code.strip(),
+            "affiliation": affiliation,
+            "country_code": country_code,
         }
         if ror_match is not None and RorMatch is not None:
             user_data["ror_match"] = {
@@ -657,6 +777,10 @@ class LocalBackend(LLMBackend):
                     timeout=min(600, self.timeout * 2),
                 )
                 content = resp.choices[0].message.content
+                if content is None:
+                    content = ""
+                content = str(content).strip()
+                LOGGER.info("CONTENIDO CRUDO DEL LLM: %s", content)
                 json_str = _extract_json_object(content)
                 parsed = json.loads(json_str)
                 return _parsed_to_result_dict(parsed)
@@ -713,9 +837,23 @@ class LocalBackend(LLMBackend):
                     max_tokens=5000,
                     timeout=600,
                 )
-                content = resp.choices[0].message.content
-                json_str = _extract_json_object(content)
-                parsed_array = json.loads(json_str)
+                raw = resp.choices[0].message.content
+                if raw is None:
+                    raw = ""
+                LOGGER.info("CONTENIDO CRUDO DEL LLM (batch): %s", raw)
+                # Si ya es objeto Python (dict/list), no procesar como texto
+                if isinstance(raw, (dict, list)):
+                    parsed_array = [raw] if isinstance(raw, dict) else raw
+                else:
+                    content = str(raw).strip()
+                    json_str = _extract_json_object(content)
+                    parsed = json.loads(json_str)
+                    if isinstance(parsed, dict):
+                        parsed_array = [parsed]
+                    elif isinstance(parsed, list):
+                        parsed_array = parsed
+                    else:
+                        parsed_array = [parsed] if parsed is not None else []
                 break
             except (json.JSONDecodeError, ValueError, KeyError, IndexError):
                 if len(items) > 1 and attempt < max_retries:
@@ -726,7 +864,7 @@ class LocalBackend(LLMBackend):
                 raise LMStudioError(f"Invalid batch response after {attempt + 1} attempts") from None
 
         if not isinstance(parsed_array, list):
-            raise LMStudioError(f"Expected JSON array, got {type(parsed_array)}")
+            parsed_array = [parsed_array] if parsed_array is not None else []
 
         if len(parsed_array) < len(items):
             parsed_array.extend([{}] * (len(items) - len(parsed_array)))
@@ -734,9 +872,17 @@ class LocalBackend(LLMBackend):
             parsed_array = parsed_array[:len(items)]
 
         results: List[Dict[str, Any]] = []
-        for idx, result_item in enumerate(parsed_array):
+        for idx in range(len(items)):
+            result_item = parsed_array[idx] if idx < len(parsed_array) else {}
+            if not isinstance(result_item, dict):
+                LOGGER.warning(
+                    "Batch item %d is not a dict (type=%s); using empty dict to preserve order.",
+                    idx,
+                    type(result_item).__name__,
+                )
+                result_item = {}
             try:
-                normalized = _parsed_to_result_dict(result_item.copy() if result_item else {})
+                normalized = _parsed_to_result_dict(result_item.copy())
                 normalized["id"] = items[idx]["id"]
                 results.append(normalized)
             except Exception as exc:
@@ -801,11 +947,16 @@ def classify_affiliation(
 ) -> Dict[str, Any]:
     """
     Clasifica una afiliación usando el backend indicado o el por defecto.
+    affiliation y country_code se convierten a str() antes de enviar al backend.
     """
     b = backend or _default_backend
     if b is None:
         b = LocalBackend({})  # fallback: LM Studio por defecto
-    return b.classify_affiliation(affiliation, country_code, ror_match)
+    return b.classify_affiliation(
+        str(affiliation) if affiliation is not None else "",
+        str(country_code) if country_code is not None else "",
+        ror_match,
+    )
 
 
 def classify_affiliations_batch(
