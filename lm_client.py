@@ -1,16 +1,24 @@
 """
-Client utilities to interact with a local LM Studio instance that exposes
-an OpenAI-compatible chat completions API.
+Clientes para clasificación de afiliaciones mediante LLMs.
+
+Arquitectura híbrida:
+- LLMBackend: clase abstracta.
+- GeminiBackend: Google Gemini (API) con salida JSON estructurada (response_schema).
+- LocalBackend: LM Studio / API compatible con OpenAI, con reintentos para JSON.
+
+Regla de oro: primero se intenta try_rule_based_classification; si devuelve None,
+se usa el backend LLM seleccionado.
 """
 from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import re
+import time
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import logging
-import re
-import requests
 from dotenv import load_dotenv
 
 try:
@@ -18,17 +26,14 @@ try:
 except ImportError:
     RorMatch = None  # type: ignore
 
-# Load environment variables from an optional .env file.
+
 load_dotenv()
 
 LOGGER = logging.getLogger("gov-affiliation-classifier.lm_client")
 
-
-LM_STUDIO_BASE_URL = os.environ.get(
-    "LM_STUDIO_BASE_URL", "http://localhost:1234/v1/chat/completions"
-)
-LM_STUDIO_MODEL_NAME = os.environ.get("LM_STUDIO_MODEL_NAME", "local-model")
-LM_STUDIO_TIMEOUT = float(os.environ.get("LM_STUDIO_TIMEOUT", "60"))
+# ---------------------------------------------------------------------------
+# Prompts (compartidos por todos los backends)
+# ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """\
 You classify institutional affiliations into a structured taxonomy.
@@ -52,9 +57,9 @@ return ONLY a valid JSON with:
 - government = federal, state, or local public entities (ministries, departments, agencies, regulatory bodies, military units).
 - university = higher education institutions and systems CONSISTING OF UNIVERSITIES:
   - Single universities, colleges, campuses.
-  - Academic departments (“Department of X”, “School of Y”, “Faculty of Z”).
+  - Academic departments ("Department of X", "School of Y", "Faculty of Z").
   - Alliances / consortia / systems / networks COMPOSED OF universities or higher education institutions
-    (e.g. “University of California System”, “Association of American Universities”).
+    (e.g. "University of California System", "Association of American Universities").
 - research_institute = organizations primarily dedicated to research (public or private) that are NOT clearly universities.
 - company = private for-profit enterprises (Inc, LLC, Corp, Ltd, Technologies, Biosciences, etc.).
 - ngo = non-profit organizations, associations, foundations, alliances or networks that are NOT single universities or clear university-only systems.
@@ -86,7 +91,7 @@ University consortia, alliances or systems:
    classify as org_type="university", NOT as ngo.
 
 Labs and Centers:
-- If clearly linked to a university (e.g. “Center for X, University of Y”, “Institute for Z at Harvard University”)
+- If clearly linked to a university (e.g. "Center for X, University of Y", "Institute for Z at Harvard University")
   → org_type="university".
 - If part of government agencies → org_type="government".
 - If clearly corporate (Inc, LLC, Technologies, Biosciences, Labs, Pharmaceuticals, etc.) → org_type="company".
@@ -166,17 +171,7 @@ If there is NO ROR match:
 ROR can be overridden by very strong evidence in the affiliation string,
 but in most cases you should align with ROR type and domain.
 
-# 6. DERIVED FIELD
-
-Normally:
-- mission_research = 1 for "AppliedResearch" or "AcademicResearch".
-- mission_research = 0 for "NonResearch" or "Enabler".
-
-EXCEPTION:
-- If a valid ROR record exists, mission_research MUST be 1,
-  and mission_research_category MUST be one of ["AppliedResearch","AcademicResearch","Enabler"].
-
-# 7. OUTPUT FORMAT
+# 6. OUTPUT FORMAT
 
 Return ONLY a JSON object with all required keys:
 - "org_type"
@@ -186,164 +181,7 @@ Return ONLY a JSON object with all required keys:
 - "mission_research"
 - "rationale"
 
-"rationale" MUST be a string (can be short).
-
-No extra text, no explanations outside the JSON.
-
-# 8. EXAMPLES (COMPLEX CASES)
-
-Example 1: Government department (administrative function)
-Affiliation: "Department of Energy"
-Country: "US"
-→ government, NonResearch
-
-{
-  "org_type": "government",
-  "gov_level": "federal",
-  "gov_local_type": "non_applicable",
-  "mission_research_category": "NonResearch",
-  "mission_research": 0,
-  "rationale": "Federal government department with administrative and policy functions, not primarily a research organization."
-}
-
-Example 2: Government department (administrative function)
-Affiliation: "Department of Education"
-Country: "US"
-→ government, NonResearch
-
-{
-  "org_type": "government",
-  "gov_level": "federal",
-  "gov_local_type": "non_applicable",
-  "mission_research_category": "NonResearch",
-  "mission_research": 0,
-  "rationale": "Federal government department with administrative and policy functions, not primarily a research organization."
-}
-
-Example 3: Academic department (academic discipline)
-Affiliation: "Department of Philosophy"
-Country: "US"
-→ university, AcademicResearch
-
-{
-  "org_type": "university",
-  "gov_level": "non_applicable",
-  "gov_local_type": "non_applicable",
-  "mission_research_category": "AcademicResearch",
-  "mission_research": 1,
-  "rationale": "Academic department of an academic discipline, performing teaching and research activities."
-}
-
-Example 4: Academic department (academic discipline)
-Affiliation: "Department of Educational Sciences"
-Country: "US"
-→ university, AcademicResearch
-
-{
-  "org_type": "university",
-  "gov_level": "non_applicable",
-  "gov_local_type": "non_applicable",
-  "mission_research_category": "AcademicResearch",
-  "mission_research": 1,
-  "rationale": "Academic department of an academic discipline, performing teaching and research activities."
-}
-
-Example 5: Academic department (academic discipline)
-Affiliation: "Department of Computer Science"
-Country: "US"
-→ university, AcademicResearch
-
-{
-  "org_type": "university",
-  "gov_level": "non_applicable",
-  "gov_local_type": "non_applicable",
-  "mission_research_category": "AcademicResearch",
-  "mission_research": 1,
-  "rationale": "Academic department of an academic discipline, performing teaching and research activities."
-}
-
-Example 6: City public health department
-Affiliation: "Division of Family Health, Rhode Island Department of Health"
-Country: "US"
-→ government, local, NonResearch
-
-{
-  "org_type": "government",
-  "gov_level": "state",
-  "gov_local_type": "other_local",
-  "mission_research_category": "NonResearch",
-  "mission_research": 0,
-  "rationale": "State department of health providing public health services, not primarily a research organization."
-}
-
-Example 7: University department
-Affiliation: "Department of Computer Science, Stanford University"
-Country: "US"
-→ university, AcademicResearch
-
-{
-  "org_type": "university",
-  "gov_level": "non_applicable",
-  "gov_local_type": "non_applicable",
-  "mission_research_category": "AcademicResearch",
-  "mission_research": 1,
-  "rationale": "Academic department within a university, with teaching and research."
-}
-
-Example 8: Alliance of universities
-Affiliation: "Association of American Universities"
-Country: "US"
-→ university, Enabler or AcademicResearch depending on role
-
-{
-  "org_type": "university",
-  "gov_level": "non_applicable",
-  "gov_local_type": "non_applicable",
-  "mission_research_category": "Enabler",
-  "mission_research": 1,
-  "rationale": "Alliance of research universities that coordinates and enables academic research."
-}
-
-Example 9: Corporate R&D center with NO ROR
-Affiliation: "3 Dimensional Pharmaceuticals, Inc."
-Country: "US"
-
-{
-  "org_type": "company",
-  "gov_level": "non_applicable",
-  "gov_local_type": "non_applicable",
-  "mission_research_category": "AppliedResearch",
-  "mission_research": 1,
-  "rationale": "Private pharmaceutical company with R&D activities."
-}
-
-Example 10: Government laboratory WITH ROR
-Affiliation: "National Security Technologies, LLC"
-Country: "US"
-ROR types: "Government, Facility"
-
-{
-  "org_type": "government",
-  "gov_level": "federal",
-  "gov_local_type": "non_applicable",
-  "mission_research_category": "AppliedResearch",
-  "mission_research": 1,
-  "rationale": "Federal government-related facility performing mission-oriented research and development."
-}
-
-Example 11: Funder WITH ROR
-Affiliation: "Georgia Clinical & Translational Science Alliance"
-Country: "US"
-ROR types: "Facility, Funder"
-
-{
-  "org_type": "university",
-  "gov_level": "non_applicable",
-  "gov_local_type": "non_applicable",
-  "mission_research_category": "Enabler",
-  "mission_research": 1,
-  "rationale": "Alliance of universities acting as a research enabler and funder in the clinical and translational research ecosystem."
-}
+"rationale" MUST be a string (can be short). No extra text, no explanations outside the JSON.
 """
 
 SYSTEM_PROMPT_BATCH = """\
@@ -373,204 +211,163 @@ CRITICAL: You MUST return a JSON array, not a single object. The array must have
 """
 
 
+# ---------------------------------------------------------------------------
+# JSON schema para Gemini (response_schema)
+# ---------------------------------------------------------------------------
+
+GEMINI_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "org_type": {"type": "string", "enum": ["supranational_organization", "government", "university", "research_institute", "company", "ngo", "hospital", "other"]},
+        "gov_level": {"type": "string", "enum": ["federal", "state", "local", "unknown", "non_applicable"]},
+        "gov_local_type": {"type": "string", "enum": ["city", "county", "other_local", "unknown", "non_applicable"]},
+        "mission_research_category": {"type": "string", "enum": ["NonResearch", "Enabler", "AppliedResearch", "AcademicResearch"]},
+        "mission_research": {"type": "integer", "enum": [0, 1]},
+        "rationale": {"type": "string"},
+    },
+    "required": ["org_type", "gov_level", "gov_local_type", "mission_research_category", "mission_research", "rationale"],
+}
+
+
+# ---------------------------------------------------------------------------
+# Excepciones y utilidades
+# ---------------------------------------------------------------------------
+
 class LMStudioError(RuntimeError):
-    """Raised when the LM Studio request fails or returns invalid data."""
+    """Raised when the LLM request fails or returns invalid data."""
 
 
 def _is_technical_error(exception: Exception) -> bool:
     """
     Determine if an exception represents a technical error (network, timeout, etc.)
-    that should trigger retry/fallback, vs semantic uncertainty that should be
-    handled with 'unknown' values.
-    
-    Returns True for technical errors, False for semantic uncertainty.
+    that should trigger retry/fallback, vs semantic uncertainty.
     """
-    import requests
-    
-    # Technical errors: network issues, timeouts, connection failures
-    if isinstance(exception, (requests.exceptions.ConnectionError,
-                              requests.exceptions.Timeout,
-                              requests.exceptions.RequestException)):
-        return True
-    
-    # LMStudioError with technical indicators
+    try:
+        import requests
+        if isinstance(exception, (requests.exceptions.ConnectionError,
+                                  requests.exceptions.Timeout,
+                                  requests.exceptions.RequestException)):
+            return True
+    except ImportError:
+        pass
+
     if isinstance(exception, LMStudioError):
         error_str = str(exception).lower()
-        technical_indicators = [
-            "timeout",
-            "connection",
-            "network",
-            "status_code",
-            "invalid response format",  # JSON completely unparseable
-        ]
+        technical_indicators = ["timeout", "connection", "network", "status_code", "invalid response format"]
         if any(indicator in error_str for indicator in technical_indicators):
             return True
-    
-    # JSON decode errors that persist after retry are technical
-    if isinstance(exception, (json.JSONDecodeError, ValueError)):
-        # If we can't extract any JSON at all, it's technical
-        # But if we have partial JSON, it's semantic
-        return False  # Treat as semantic - we'll normalize to unknown
-    
+
     return False
 
 
 def _normalize_to_unknown(result_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize a result dictionary to ensure no None/NaN values in analytical fields.
-    Replaces missing or invalid values with appropriate defaults ('unknown' or 'non_applicable').
-    """
+    """Normalize a result dict: replace missing/invalid values with 'unknown' or 'non_applicable'."""
     valid_org_types = {
         "supranational_organization", "government", "university", "research_institute",
-        "company", "ngo", "hospital", "other", "unknown"
+        "company", "ngo", "hospital", "other", "unknown",
     }
     valid_gov_levels = {"federal", "state", "local", "unknown", "non_applicable"}
     valid_gov_local_types = {"city", "county", "other_local", "unknown", "non_applicable"}
     valid_mission_categories = {"NonResearch", "Enabler", "AppliedResearch", "AcademicResearch", "unknown"}
-    
-    # Normalize org_type
+
     org_type = result_dict.get("org_type")
     if not org_type or org_type not in valid_org_types:
         org_type = "unknown"
         result_dict["org_type"] = org_type
-    
-    # Normalize gov_level based on org_type
+
     gov_level = result_dict.get("gov_level")
     if not gov_level or gov_level not in valid_gov_levels:
-        if org_type == "government":
-            gov_level = "unknown"
-        else:
-            gov_level = "non_applicable"
+        gov_level = "unknown" if org_type == "government" else "non_applicable"
         result_dict["gov_level"] = gov_level
-    
-    # Normalize gov_local_type based on gov_level
+
     gov_local_type = result_dict.get("gov_local_type")
     if not gov_local_type or gov_local_type not in valid_gov_local_types:
-        if org_type == "government" and gov_level == "local":
-            gov_local_type = "unknown"
-        else:
-            gov_local_type = "non_applicable"
+        gov_local_type = "unknown" if (org_type == "government" and gov_level == "local") else "non_applicable"
         result_dict["gov_local_type"] = gov_local_type
-    
-    # Normalize mission_research_category
+
     mission_category = result_dict.get("mission_research_category")
     if not mission_category or mission_category not in valid_mission_categories:
         mission_category = "unknown"
         result_dict["mission_research_category"] = mission_category
-    
-    # Derive mission_research from category
+
     if mission_category in {"AppliedResearch", "AcademicResearch"}:
         mission_research = 1
-    elif mission_category in {"NonResearch", "Enabler", "unknown"}:
-        mission_research = 0
     else:
-        mission_research = 0  # Default fallback
-    
+        mission_research = 0
     result_dict["mission_research"] = mission_research
-    
-    # Ensure rationale exists
+
     if "rationale" not in result_dict:
         result_dict["rationale"] = ""
-    
+
     return result_dict
 
 
 def _extract_json_object(text: str) -> str:
-    """
-    Extract the first JSON object from a text response, stripping ``` fences.
-
-    Raises ValueError if no JSON-like object can be found.
-    """
+    """Extract the first JSON object or array from a text response, stripping ``` fences."""
     if not text:
-        raise ValueError("Empty response from LM Studio")
+        raise ValueError("Empty response from LLM")
 
     cleaned = text.strip()
-
-    # Remove ```json ... ``` style fences if present
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
         cleaned = re.sub(r"```$", "", cleaned).strip()
 
-    # Look for the first {...} block or [...] array
     match_arr = re.search(r"\[.*\]", cleaned, flags=re.DOTALL)
     match_obj = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-    
     if match_arr:
         return match_arr.group(0).strip()
-    elif match_obj:
+    if match_obj:
         return match_obj.group(0).strip()
-
-    # Fallback: assume entire content is JSON
     return cleaned
 
+
+def _parsed_to_result_dict(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert parsed LLM response to normalized result dict (same shape for all backends)."""
+    parsed = _normalize_to_unknown(parsed.copy())
+    org_type = parsed.get("org_type")
+    if org_type != "government":
+        parsed["gov_level"] = "non_applicable"
+        parsed["gov_local_type"] = "non_applicable"
+    elif parsed.get("gov_level") != "local":
+        parsed["gov_local_type"] = "non_applicable"
+
+    for key in ("confidence_org_type", "confidence_gov_level", "confidence_mission_research"):
+        if key not in parsed:
+            parsed[key] = None
+    return parsed
+
+
+# ---------------------------------------------------------------------------
+# Regla basada en reglas (conservada)
+# ---------------------------------------------------------------------------
 
 def try_rule_based_classification(
     affiliation: str, country_code: str | None, ror_info: dict | None
 ) -> dict | None:
     """
-    Attempt to classify an affiliation using conservative rule-based logic with ROR data.
-    
-    This function implements fast-track classification for clear cases (universities,
-    funders, teaching hospitals) to avoid unnecessary LLM calls.
-    
-    Parameters
-    ----------
-    affiliation:
-        The raw affiliation string.
-    country_code:
-        Optional ISO country code.
-    ror_info:
-        Optional dict with ROR match information. Expected keys:
-        - ror_types: list of ROR type strings
-        - ror_name: ROR organization name
-    
-    Returns
-    -------
-    dict or None
-        Classification dict with same keys as LLM response if classification is clear,
-        None if rules don't apply or case is ambiguous (should use LLM).
+    Intenta clasificar una afiliación con reglas conservadoras usando ROR.
+
+    Si las reglas no aplican o el caso es ambiguo, devuelve None (usar LLM).
     """
     if ror_info is None:
         return None
-    
+
     ror_types = ror_info.get("ror_types", [])
     ror_name = ror_info.get("ror_name", "")
     affiliation_lower = affiliation.lower()
     ror_name_lower = ror_name.lower() if ror_name else ""
-    
-    # Combine affiliation and ROR name for pattern matching
     combined_text = f"{affiliation_lower} {ror_name_lower}".strip()
-    
+
     # Rule A: Clear universities
     if "education" in [t.lower() for t in ror_types]:
-        # Patterns that clearly indicate a university
         university_patterns = [
-            "university",
-            "college",
-            "institute of technology",
-            "polytechnic",
-            "school of",
-            "universidad",
-            "université",
-            "universität",
-            "universita",
+            "university", "college", "institute of technology", "polytechnic",
+            "school of", "universidad", "université", "universität", "universita",
         ]
-        
-        # Check if any pattern matches
-        is_university = any(pattern in combined_text for pattern in university_patterns)
-        
-        # Exclude consortia and associations
         exclusion_patterns = [
-            "consortium",
-            "association",
-            "alliance",
-            "coalition",
-            "council of",
-            "network of",
+            "consortium", "association", "alliance", "coalition", "council of", "network of",
         ]
-        is_excluded = any(pattern in combined_text for pattern in exclusion_patterns)
-        
-        if is_university and not is_excluded:
+        if any(p in combined_text for p in university_patterns) and not any(p in combined_text for p in exclusion_patterns):
             return {
                 "org_type": "university",
                 "gov_level": "non_applicable",
@@ -582,44 +379,19 @@ def try_rule_based_classification(
                 "confidence_mission_research": 0.95,
                 "rationale": "",
             }
-    
+
     # Rule B: Clear funders (Enabler)
     if "funder" in [t.lower() for t in ror_types]:
-        # Patterns that clearly indicate a funding organization
         funder_patterns = [
-            "foundation",
-            "research council",
-            "funding",
-            "science foundation",
-            "national science",
-            "research fund",
-            "grant",
-            "funder",
+            "foundation", "research council", "funding", "science foundation",
+            "national science", "research fund", "grant", "funder",
         ]
-        
-        is_funder = any(pattern in combined_text for pattern in funder_patterns)
-        
-        if is_funder:
-            # Determine if it's government or NGO based on name patterns
-            gov_patterns = [
-                "national science",
-                "national research",
-                "ministry",
-                "department",
-                "agency",
-                "government",
-            ]
-            is_government = any(pattern in combined_text for pattern in gov_patterns)
-            
-            # Determine gov_level if it's government
-            if is_government:
-                # Check for federal indicators (US-specific)
-                federal_patterns = ["national", "federal", "u.s.", "us "]
-                is_federal = any(pattern in combined_text for pattern in federal_patterns)
-                gov_level = "federal" if is_federal else "unknown"
-            else:
-                gov_level = "non_applicable"
-            
+        if any(p in combined_text for p in funder_patterns):
+            gov_patterns = ["national science", "national research", "ministry", "department", "agency", "government"]
+            is_government = any(p in combined_text for p in gov_patterns)
+            federal_patterns = ["national", "federal", "u.s.", "us "]
+            is_federal = any(p in combined_text for p in federal_patterns)
+            gov_level = "federal" if (is_government and is_federal) else ("unknown" if is_government else "non_applicable")
             return {
                 "org_type": "government" if is_government else "ngo",
                 "gov_level": gov_level,
@@ -631,22 +403,14 @@ def try_rule_based_classification(
                 "confidence_mission_research": 0.95,
                 "rationale": "",
             }
-    
+
     # Rule C: Clear teaching hospitals
     if "healthcare" in [t.lower() for t in ror_types]:
-        # Patterns that clearly indicate a teaching/academic hospital
         teaching_hospital_patterns = [
-            "university hospital",
-            "academic medical center",
-            "teaching hospital",
-            "medical center university",
-            "university medical",
-            "academic hospital",
+            "university hospital", "academic medical center", "teaching hospital",
+            "medical center university", "university medical", "academic hospital",
         ]
-        
-        is_teaching_hospital = any(pattern in combined_text for pattern in teaching_hospital_patterns)
-        
-        if is_teaching_hospital:
+        if any(p in combined_text for p in teaching_hospital_patterns):
             return {
                 "org_type": "hospital",
                 "gov_level": "non_applicable",
@@ -658,160 +422,81 @@ def try_rule_based_classification(
                 "confidence_mission_research": 0.9,
                 "rationale": "",
             }
-    
-    # If no rule applies, return None to use LLM
+
     return None
 
 
-def _post_chat_completion(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Send a chat completion request and return the raw response JSON."""
-    response = requests.post(
-        LM_STUDIO_BASE_URL,
-        json=payload,
-        timeout=600,
-    )
-    if response.status_code != 200:
-        raise LMStudioError(
-            f"LM Studio returned {response.status_code}: {response.text}"
-        )
-    return response.json()
+# ---------------------------------------------------------------------------
+# Backend abstracto e implementaciones
+# ---------------------------------------------------------------------------
+
+BackendConfig = Dict[str, Any]
 
 
-def classify_affiliation(
-    affiliation: str, country_code: str, ror_match: Optional[Any] = None
-) -> Dict[str, Any]:
-    """
-    Classify whether an affiliation is governmental using LM Studio.
+class LLMBackend(ABC):
+    """Backend abstracto para clasificación mediante LLM."""
 
-    Parameters
-    ----------
-    affiliation:
-        The raw affiliation string.
-    country_code:
-        ISO country code (if unknown, send an empty string).
-    ror_match:
-        Optional RorMatch object with ROR information.
+    @abstractmethod
+    def classify_affiliation(
+        self,
+        affiliation: str,
+        country_code: str,
+        ror_match: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Clasifica una afiliación. Devuelve dict con org_type, gov_level, etc."""
+        ...
 
-    Returns
-    -------
-    dict
-        Dictionary with keys: org_type, gov_level, gov_local_type, mission_research_category,
-        mission_research, rationale.
-    """
-    # Build user message with affiliation and optional ROR info
-    user_data: Dict[str, Any] = {
-        "affiliation": affiliation.strip(),
-        "country_code": country_code.strip(),
-    }
-    
-    if ror_match is not None:
-        user_data["ror_match"] = {
-            "ror_id": ror_match.ror_id,
-            "ror_name": ror_match.ror_name,
-            "ror_types": ror_match.ror_types,
-            "ror_country_code": ror_match.ror_country_code,
-            "ror_state": ror_match.ror_state,
-            "ror_city": ror_match.ror_city,
-            "ror_domains": ror_match.ror_domains,
-            "match_score": ror_match.match_score,
+    @abstractmethod
+    def classify_affiliations_batch(
+        self,
+        items: List[Dict[str, Any]],
+        max_retries: int = 2,
+    ) -> List[Dict[str, Any]]:
+        """Clasifica varias afiliaciones en una sola llamada. Mismo orden que items."""
+        ...
+
+
+class GeminiBackend(LLMBackend):
+    """Backend usando Google Gemini (API) con salida JSON estructurada (response_schema)."""
+
+    def __init__(self, config: BackendConfig):
+        self.api_key = config.get("api_key") or os.environ.get("GEMINI_API_KEY")
+        if not self.api_key:
+            raise ValueError("Gemini backend requires api_key in config or GEMINI_API_KEY in environment")
+        self.model_name = config.get("model_name", "gemini-1.5-flash")
+        self._client = None
+
+    def _get_model(self):
+        import google.generativeai as genai
+        genai.configure(api_key=self.api_key)
+        try:
+            config = genai.types.GenerationConfig(
+                temperature=0.0,
+                max_output_tokens=256,
+                response_mime_type="application/json",
+                response_schema=GEMINI_RESPONSE_SCHEMA,
+            )
+        except (TypeError, AttributeError):
+            # Algunas versiones no soportan response_schema; usar solo JSON
+            config = genai.types.GenerationConfig(
+                temperature=0.0,
+                max_output_tokens=256,
+                response_mime_type="application/json",
+            )
+        return genai.GenerativeModel(self.model_name, generation_config=config)
+
+    def classify_affiliation(
+        self,
+        affiliation: str,
+        country_code: str,
+        ror_match: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        user_data: Dict[str, Any] = {
+            "affiliation": affiliation.strip(),
+            "country_code": country_code.strip(),
         }
-        if ror_match.suggested_org_type_from_ror:
-            user_data["ror_match"]["suggested_org_type_from_ror"] = ror_match.suggested_org_type_from_ror
-    
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": json.dumps(user_data),
-        },
-    ]
-    payload = {
-        "model": LM_STUDIO_MODEL_NAME,
-        "messages": messages,
-        "temperature": 0.0,
-        "max_tokens": 150,  # Increased to accommodate mission_research_category
-        # "response_format": {"type": "json_object"},
-    }
-
-    completion = _post_chat_completion(payload)
-    try:
-        content = completion["choices"][0]["message"]["content"]
-        json_str = _extract_json_object(content)
-        parsed = json.loads(json_str)
-    except (KeyError, IndexError, json.JSONDecodeError, ValueError) as exc:
-        raise LMStudioError(f"Invalid response format from LM Studio: {content!r}") from exc
-
-    # Normalization step: fix inconsistent combinations before validation
-    valid_org_types = {
-        "supranational_organization",
-        "government",
-        "university",
-        "research_institute",
-        "company",
-        "ngo",
-        "hospital",
-        "other",
-    }
-    valid_gov_levels = {"federal", "state", "local", "unknown", "non_applicable"}
-    valid_gov_local_types = {"city", "county", "other_local", "unknown", "non_applicable"}
-
-    # Normalize using helper function - this ensures no None/NaN values
-    parsed = _normalize_to_unknown(parsed)
-    
-    # Apply business logic constraints after normalization
-    org_type = parsed.get("org_type")
-    
-    # If org_type is NOT "government", force both gov fields to "non_applicable"
-    if org_type != "government":
-        parsed["gov_level"] = "non_applicable"
-        parsed["gov_local_type"] = "non_applicable"
-    # If org_type is "government" but gov_level is NOT "local", force gov_local_type to "non_applicable"
-    elif org_type == "government" and parsed.get("gov_level") != "local":
-        parsed["gov_local_type"] = "non_applicable"
-    
-    # Add confidence fields as empty/None for compatibility (not used but kept for CSV output)
-    if "confidence_org_type" not in parsed:
-        parsed["confidence_org_type"] = None
-    if "confidence_gov_level" not in parsed:
-        parsed["confidence_gov_level"] = None
-    if "confidence_mission_research" not in parsed:
-        parsed["confidence_mission_research"] = None
-    
-    return parsed
-
-
-def classify_affiliations_batch(
-    items: List[Dict[str, Any]], max_retries: int = 2
-) -> List[Dict[str, Any]]:
-    """
-    Classify multiple affiliations in a single LLM call (batch processing).
-
-    Parameters
-    ----------
-    items:
-        List of dicts, each with keys: "id", "affiliation", "country_code", and optionally "ror_match".
-    max_retries:
-        Maximum number of retry attempts with smaller batches if parsing fails.
-
-    Returns
-    -------
-    List[Dict[str, Any]]
-        List of classification results, one per input item, in the same order.
-    """
-    if not items:
-        return []
-
-    # Build batch request
-    batch_data = []
-    for item in items:
-        entry: Dict[str, Any] = {
-            "id": item["id"],
-            "affiliation": str(item["affiliation"]).strip(),
-            "country_code": str(item.get("country_code", "")).strip(),
-        }
-        if "ror_match" in item and item["ror_match"] is not None:
-            ror_match = item["ror_match"]
-            entry["ror_match"] = {
+        if ror_match is not None and RorMatch is not None:
+            user_data["ror_match"] = {
                 "ror_id": ror_match.ror_id,
                 "ror_name": ror_match.ror_name,
                 "ror_types": ror_match.ror_types,
@@ -821,140 +506,317 @@ def classify_affiliations_batch(
                 "ror_domains": ror_match.ror_domains,
                 "match_score": ror_match.match_score,
             }
-            if ror_match.suggested_org_type_from_ror:
-                entry["ror_match"]["suggested_org_type_from_ror"] = ror_match.suggested_org_type_from_ror
-        batch_data.append(entry)
+            if getattr(ror_match, "suggested_org_type_from_ror", None):
+                user_data["ror_match"]["suggested_org_type_from_ror"] = ror_match.suggested_org_type_from_ror
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT_BATCH},
-        {
-            "role": "user",
-            "content": json.dumps(batch_data),
-        },
-    ]
-    payload = {
-        "model": LM_STUDIO_MODEL_NAME,
-        "messages": messages,
-        "temperature": 0.0,
-        "max_tokens": 5000,  # Increased for batch processing
-    }
-
-    try:
-        completion = _post_chat_completion(payload)
-        content = completion["choices"][0]["message"]["content"]
-        json_str = _extract_json_object(content)
-        parsed_array = json.loads(json_str)
-    except (KeyError, IndexError, json.JSONDecodeError, ValueError) as exc:
-        # If parsing fails and we can retry with smaller batch, do so
-        if len(items) > 1 and max_retries > 0:
-            LOGGER.warning(
-                "Batch parsing failed for %d items, splitting in half and retrying. Error: %s",
-                len(items),
-                exc,
-            )
-            mid = len(items) // 2
-            first_half = classify_affiliations_batch(items[:mid], max_retries - 1)
-            second_half = classify_affiliations_batch(items[mid:], max_retries - 1)
-            return first_half + second_half
-        else:
-            raise LMStudioError(f"Invalid batch response format from LM Studio: {content!r}") from exc
-
-    # Validate that we got an array
-    if not isinstance(parsed_array, list):
-        raise LMStudioError(f"Expected JSON array, got {type(parsed_array)}: {json.dumps(parsed_array)[:200]}")
-
-    # Handle length mismatch - be tolerant, complete missing items with "unknown"
-    if len(parsed_array) < len(items):
-        LOGGER.warning(
-            "Response array length %d is less than input length %d. Completing missing items with 'unknown'.",
-            len(parsed_array),
-            len(items)
-        )
-        # Pad with empty dicts that will be normalized to "unknown"
-        parsed_array.extend([{}] * (len(items) - len(parsed_array)))
-    elif len(parsed_array) > len(items):
-        LOGGER.warning(
-            "Response array length %d is greater than input length %d. Truncating excess items.",
-            len(parsed_array),
-            len(items)
-        )
-        parsed_array = parsed_array[:len(items)]
-
-    # Normalize and validate each result - tolerate partial failures
-    results = []
-    id_to_index = {item["id"]: idx for idx, item in enumerate(items)}
-    
-    for idx, result_item in enumerate(parsed_array):
+        model = self._get_model()
+        prompt = f"{SYSTEM_PROMPT}\n\nInput:\n{json.dumps(user_data)}"
+        response = model.generate_content(prompt)
+        text = response.text if hasattr(response, "text") else (response.candidates[0].content.parts[0].text if response.candidates else "")
+        if not text:
+            raise LMStudioError("Gemini returned empty response")
         try:
-            # Normalize using helper function - ensures no None/NaN values
-            normalized = _normalize_to_unknown(result_item.copy() if result_item else {})
-            
-            # Apply business logic constraints after normalization
-            org_type = normalized.get("org_type")
-            if org_type != "government":
-                normalized["gov_level"] = "non_applicable"
-                normalized["gov_local_type"] = "non_applicable"
-            elif org_type == "government" and normalized.get("gov_level") != "local":
-                normalized["gov_local_type"] = "non_applicable"
-            
-            # Add confidence fields for compatibility
-            if "confidence_org_type" not in normalized:
-                normalized["confidence_org_type"] = None
-            if "confidence_gov_level" not in normalized:
-                normalized["confidence_gov_level"] = None
-            if "confidence_mission_research" not in normalized:
-                normalized["confidence_mission_research"] = None
-            
-            # Ensure id is present
-            if "id" not in normalized and idx < len(items):
+            json_str = _extract_json_object(text)
+            parsed = json.loads(json_str)
+        except (ValueError, json.JSONDecodeError) as e:
+            raise LMStudioError(f"Gemini returned invalid JSON: {e}") from e
+        return _parsed_to_result_dict(parsed)
+
+    def classify_affiliations_batch(
+        self,
+        items: List[Dict[str, Any]],
+        max_retries: int = 2,
+    ) -> List[Dict[str, Any]]:
+        if not items:
+            return []
+
+        batch_data = []
+        for item in items:
+            entry: Dict[str, Any] = {
+                "id": item["id"],
+                "affiliation": str(item["affiliation"]).strip(),
+                "country_code": str(item.get("country_code", "")).strip(),
+            }
+            if "ror_match" in item and item["ror_match"] is not None:
+                ror = item["ror_match"]
+                entry["ror_match"] = {
+                    "ror_id": ror.ror_id,
+                    "ror_name": ror.ror_name,
+                    "ror_types": ror.ror_types,
+                    "ror_country_code": ror.ror_country_code,
+                    "ror_state": ror.ror_state,
+                    "ror_city": ror.ror_city,
+                    "ror_domains": ror.ror_domains,
+                    "match_score": ror.match_score,
+                }
+                if getattr(ror, "suggested_org_type_from_ror", None):
+                    entry["ror_match"]["suggested_org_type_from_ror"] = ror.suggested_org_type_from_ror
+            batch_data.append(entry)
+
+        model = self._get_model()
+        # Gemini with response_schema is single-object; for batch we ask for array in prompt and parse
+        prompt = f"{SYSTEM_PROMPT_BATCH}\n\nInput:\n{json.dumps(batch_data)}"
+        # For batch, we don't use response_schema (array); we use plain JSON and extract
+        import google.generativeai as genai
+        genai.configure(api_key=self.api_key)
+        model_batch = genai.GenerativeModel(
+            self.model_name,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.0,
+                max_output_tokens=8192,
+                response_mime_type="application/json",
+            ),
+        )
+        response = model_batch.generate_content(prompt)
+        text = response.text if hasattr(response, "text") else (response.candidates[0].content.parts[0].text if response.candidates else "")
+        if not text:
+            raise LMStudioError("Gemini batch returned empty response")
+        json_str = _extract_json_object(text)
+        parsed_array = json.loads(json_str)
+
+        if not isinstance(parsed_array, list):
+            raise LMStudioError(f"Expected JSON array, got {type(parsed_array)}")
+
+        if len(parsed_array) < len(items):
+            parsed_array.extend([{}] * (len(items) - len(parsed_array)))
+        elif len(parsed_array) > len(items):
+            parsed_array = parsed_array[:len(items)]
+
+        results: List[Dict[str, Any]] = []
+        for idx, result_item in enumerate(parsed_array):
+            try:
+                normalized = _parsed_to_result_dict(result_item.copy() if result_item else {})
                 normalized["id"] = items[idx]["id"]
-            
-            results.append(normalized)
-        except Exception as exc:
-            # If normalization fails, create a result with "unknown" values
-            LOGGER.warning(
-                "Failed to normalize batch result item %d: %s. Using 'unknown' values.",
-                idx,
-                exc
-            )
-            unknown_result = {
-                "id": items[idx]["id"] if idx < len(items) else None,
-                "org_type": "unknown",
-                "gov_level": "unknown",
-                "gov_local_type": "unknown",
-                "mission_research_category": "unknown",
-                "mission_research": 0,
-                "confidence_org_type": None,
-                "confidence_gov_level": None,
-                "confidence_mission_research": None,
-                "rationale": f"Normalization error: {exc}",
+                results.append(normalized)
+            except Exception as exc:
+                LOGGER.warning("Failed to normalize batch item %d: %s", idx, exc)
+                results.append({
+                    "id": items[idx]["id"],
+                    "org_type": "unknown",
+                    "gov_level": "unknown",
+                    "gov_local_type": "unknown",
+                    "mission_research_category": "unknown",
+                    "mission_research": 0,
+                    "confidence_org_type": None,
+                    "confidence_gov_level": None,
+                    "confidence_mission_research": None,
+                    "rationale": str(exc),
+                })
+        return results
+
+
+class LocalBackend(LLMBackend):
+    """Backend OpenAI-compatible (LM Studio, etc.) con reintentos para JSON."""
+
+    def __init__(self, config: BackendConfig):
+        self.base_url = config.get("base_url") or os.environ.get("LM_STUDIO_BASE_URL", "http://localhost:1234/v1")
+        self.model_name = config.get("model_name") or os.environ.get("LM_STUDIO_MODEL_NAME", "local-model")
+        self.timeout = float(config.get("timeout") or os.environ.get("LM_STUDIO_TIMEOUT", "60"))
+        self.max_retries = int(config.get("max_retries", 2))
+
+    def _get_client(self):
+        from openai import OpenAI
+        return OpenAI(base_url=self.base_url, api_key="lm-studio")
+
+    def classify_affiliation(
+        self,
+        affiliation: str,
+        country_code: str,
+        ror_match: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        user_data: Dict[str, Any] = {
+            "affiliation": affiliation.strip(),
+            "country_code": country_code.strip(),
+        }
+        if ror_match is not None and RorMatch is not None:
+            user_data["ror_match"] = {
+                "ror_id": ror_match.ror_id,
+                "ror_name": ror_match.ror_name,
+                "ror_types": ror_match.ror_types,
+                "ror_country_code": ror_match.ror_country_code,
+                "ror_state": ror_match.ror_state,
+                "ror_city": ror_match.ror_city,
+                "ror_domains": ror_match.ror_domains,
+                "match_score": ror_match.match_score,
             }
-            results.append(unknown_result)
+            if getattr(ror_match, "suggested_org_type_from_ror", None):
+                user_data["ror_match"]["suggested_org_type_from_ror"] = ror_match.suggested_org_type_from_ror
 
-    # Sort results by original input order using id mapping
-    results_sorted = [None] * len(items)
-    for result in results:
-        result_id = result.get("id")
-        if result_id in id_to_index:
-            results_sorted[id_to_index[result_id]] = result
-        else:
-            LOGGER.warning("Result with id '%s' not found in input items", result_id)
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(user_data)},
+        ]
+        client = self._get_client()
+        for attempt in range(self.max_retries + 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=0.0,
+                    max_tokens=256,
+                    timeout=min(600, self.timeout * 2),
+                )
+                content = resp.choices[0].message.content
+                json_str = _extract_json_object(content)
+                parsed = json.loads(json_str)
+                return _parsed_to_result_dict(parsed)
+            except (json.JSONDecodeError, ValueError, KeyError, IndexError) as e:
+                if attempt < self.max_retries:
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                raise LMStudioError(f"Invalid JSON response after {self.max_retries + 1} attempts: {e}") from e
+        raise LMStudioError("Unreachable")
 
-    # Fill any missing results with "unknown" values (not None)
-    for idx, result in enumerate(results_sorted):
-        if result is None:
-            results_sorted[idx] = {
-                "id": items[idx]["id"],
-                "org_type": "unknown",
-                "gov_level": "unknown",
-                "gov_local_type": "unknown",
-                "mission_research_category": "unknown",
-                "mission_research": 0,
-                "confidence_org_type": None,
-                "confidence_gov_level": None,
-                "confidence_mission_research": None,
-                "rationale": "Result missing from batch response",
+    def classify_affiliations_batch(
+        self,
+        items: List[Dict[str, Any]],
+        max_retries: int = 2,
+    ) -> List[Dict[str, Any]]:
+        if not items:
+            return []
+
+        batch_data = []
+        for item in items:
+            entry: Dict[str, Any] = {
+                "id": item["id"],
+                "affiliation": str(item["affiliation"]).strip(),
+                "country_code": str(item.get("country_code", "")).strip(),
             }
+            if "ror_match" in item and item["ror_match"] is not None:
+                ror = item["ror_match"]
+                entry["ror_match"] = {
+                    "ror_id": ror.ror_id,
+                    "ror_name": ror.ror_name,
+                    "ror_types": ror.ror_types,
+                    "ror_country_code": ror.ror_country_code,
+                    "ror_state": ror.ror_state,
+                    "ror_city": ror.ror_city,
+                    "ror_domains": ror.ror_domains,
+                    "match_score": ror.match_score,
+                }
+                if getattr(ror, "suggested_org_type_from_ror", None):
+                    entry["ror_match"]["suggested_org_type_from_ror"] = ror.suggested_org_type_from_ror
+            batch_data.append(entry)
 
-    return results_sorted
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_BATCH},
+            {"role": "user", "content": json.dumps(batch_data)},
+        ]
+        client = self._get_client()
 
+        for attempt in range(max_retries + 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=0.0,
+                    max_tokens=5000,
+                    timeout=600,
+                )
+                content = resp.choices[0].message.content
+                json_str = _extract_json_object(content)
+                parsed_array = json.loads(json_str)
+                break
+            except (json.JSONDecodeError, ValueError, KeyError, IndexError):
+                if len(items) > 1 and attempt < max_retries:
+                    mid = len(items) // 2
+                    first = self.classify_affiliations_batch(items[:mid], max_retries - 1)
+                    second = self.classify_affiliations_batch(items[mid:], max_retries - 1)
+                    return first + second
+                raise LMStudioError(f"Invalid batch response after {attempt + 1} attempts") from None
+
+        if not isinstance(parsed_array, list):
+            raise LMStudioError(f"Expected JSON array, got {type(parsed_array)}")
+
+        if len(parsed_array) < len(items):
+            parsed_array.extend([{}] * (len(items) - len(parsed_array)))
+        elif len(parsed_array) > len(items):
+            parsed_array = parsed_array[:len(items)]
+
+        results: List[Dict[str, Any]] = []
+        for idx, result_item in enumerate(parsed_array):
+            try:
+                normalized = _parsed_to_result_dict(result_item.copy() if result_item else {})
+                normalized["id"] = items[idx]["id"]
+                results.append(normalized)
+            except Exception as exc:
+                LOGGER.warning("Failed to normalize batch item %d: %s", idx, exc)
+                results.append({
+                    "id": items[idx]["id"],
+                    "org_type": "unknown",
+                    "gov_level": "unknown",
+                    "gov_local_type": "unknown",
+                    "mission_research_category": "unknown",
+                    "mission_research": 0,
+                    "confidence_org_type": None,
+                    "confidence_gov_level": None,
+                    "confidence_mission_research": None,
+                    "rationale": str(exc),
+                })
+        return results
+
+
+def get_classifier(
+    backend_type: Literal["gemini", "local"],
+    config: Optional[BackendConfig] = None,
+) -> LLMBackend:
+    """
+    Factory: devuelve la instancia del backend solicitado.
+
+    - backend_type: "gemini" | "local"
+    - config: dict con claves según backend:
+      - gemini: api_key, model_name (opcional)
+      - local: base_url, model_name, timeout, max_retries (opcionales)
+    """
+    config = config or {}
+    if backend_type == "gemini":
+        return GeminiBackend(config)
+    if backend_type == "local":
+        return LocalBackend(config)
+    raise ValueError(f"Unknown backend_type: {backend_type!r}. Use 'gemini' or 'local'.")
+
+
+# ---------------------------------------------------------------------------
+# API de conveniencia (usa backend por defecto para compatibilidad con main.py)
+# ---------------------------------------------------------------------------
+
+_default_backend: Optional[LLMBackend] = None
+
+
+def set_default_backend(backend: LLMBackend) -> None:
+    """Establece el backend por defecto (para main.py y scripts)."""
+    global _default_backend
+    _default_backend = backend
+
+
+def get_default_backend() -> Optional[LLMBackend]:
+    return _default_backend
+
+
+def classify_affiliation(
+    affiliation: str,
+    country_code: str,
+    ror_match: Optional[Any] = None,
+    backend: Optional[LLMBackend] = None,
+) -> Dict[str, Any]:
+    """
+    Clasifica una afiliación usando el backend indicado o el por defecto.
+    """
+    b = backend or _default_backend
+    if b is None:
+        b = LocalBackend({})  # fallback: LM Studio por defecto
+    return b.classify_affiliation(affiliation, country_code, ror_match)
+
+
+def classify_affiliations_batch(
+    items: List[Dict[str, Any]],
+    max_retries: int = 2,
+    backend: Optional[LLMBackend] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Clasifica varias afiliaciones en batch usando el backend indicado o el por defecto.
+    """
+    b = backend or _default_backend
+    if b is None:
+        b = LocalBackend({})
+    return b.classify_affiliations_batch(items, max_retries)

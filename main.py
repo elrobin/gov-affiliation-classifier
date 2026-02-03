@@ -13,6 +13,8 @@ from lm_client import (
     LMStudioError,
     classify_affiliation,
     classify_affiliations_batch,
+    get_classifier,
+    set_default_backend,
     try_rule_based_classification,
     _is_technical_error,
 )
@@ -53,6 +55,27 @@ def _parse_args() -> argparse.Namespace:
         "--enable-individual-fallback",
         action="store_true",
         help="Enable individual reprocessing on technical errors (slower, for debugging only)",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["gemini", "local"],
+        default="local",
+        help="LLM backend: 'gemini' (Google API) or 'local' (LM Studio / OpenAI-compatible). Default: local.",
+    )
+    parser.add_argument(
+        "--gemini-api-key",
+        default=None,
+        help="Google Gemini API key (or set GEMINI_API_KEY). Used when --backend=gemini.",
+    )
+    parser.add_argument(
+        "--local-url",
+        default=None,
+        help="Base URL for local LLM (e.g. http://localhost:1234/v1). Used when --backend=local. (Or set LM_STUDIO_BASE_URL.)",
+    )
+    parser.add_argument(
+        "--local-model",
+        default=None,
+        help="Model name for local backend (or set LM_STUDIO_MODEL_NAME).",
     )
     return parser.parse_args()
 
@@ -371,78 +394,65 @@ def _process_batch(
     return results, rule_based_count, 1 if llm_items else 0
 
 
-def main() -> None:
-    global ENABLE_INDIVIDUAL_FALLBACK
-    args = _parse_args()
-    
-    # Set global flag from CLI argument
-    ENABLE_INDIVIDUAL_FALLBACK = args.enable_individual_fallback
-    if ENABLE_INDIVIDUAL_FALLBACK:
-        LOGGER.info("Individual fallback ENABLED (debugging mode - slower)")
-    else:
-        LOGGER.info("Individual fallback DISABLED (production mode - faster)")
+def run_classification_pipeline(
+    df: pd.DataFrame,
+    ror_path: Optional[str] = None,
+    batch_size: int = 8,
+    enable_individual_fallback: bool = False,
+) -> pd.DataFrame:
+    """
+    Ejecuta el pipeline de clasificación sobre un DataFrame.
 
-    LOGGER.info("Reading input CSV: %s", args.input)
-    df = pd.read_csv(args.input)
+    Usa el backend por defecto (establecido con set_default_backend).
+    Requiere columnas: afid, affiliation, country_code.
 
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame original enriquecido con columnas de clasificación y ROR.
+    """
     required_cols = {"afid", "affiliation", "country_code"}
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    # Load ROR index
     ror_available = False
-    LOGGER.info("Loading ROR knowledge base...")
-    try:
-        load_ror(args.ror_path)
-        ror_available = True
-        LOGGER.info("ROR knowledge base loaded successfully")
-    except Exception as err:
-        LOGGER.warning("Failed to load ROR dump: %s. Continuing without ROR matching.", err)
+    if ror_path:
+        try:
+            load_ror(ror_path)
+            ror_available = True
+            LOGGER.info("ROR knowledge base loaded successfully")
+        except Exception as err:
+            LOGGER.warning("Failed to load ROR dump: %s. Continuing without ROR matching.", err)
 
-    LOGGER.info("Classifying %d rows with batching...", len(df))
-    
-    # ROR cache: (affiliation, country_code) -> RorMatch
     ror_cache: Dict[Tuple[str, Optional[str]], Optional[RorMatch]] = {}
-    
-    # Process in batches
-    batch_size = 8
-    all_results = []
+    all_results: List[Tuple[int, Dict[str, Any]]] = []
     total_rule_based = 0
     total_llm_batches = 0
-    
+
     for batch_start in range(0, len(df), batch_size):
         batch_end = min(batch_start + batch_size, len(df))
         batch_df = df.iloc[batch_start:batch_end]
-        
         LOGGER.info("Processing batch %d-%d of %d...", batch_start + 1, batch_end, len(df))
-        
         batch_results, rule_based_count, llm_batch_count = _process_batch(
             batch_df, ror_cache, ror_available, batch_size
         )
-        
         all_results.extend(batch_results)
         total_rule_based += rule_based_count
         total_llm_batches += llm_batch_count
-    
+
     LOGGER.info(
         "Classification complete: %d rule-based, %d LLM batch calls",
         total_rule_based,
         total_llm_batches,
     )
-    
-    # Merge results by afid with safe deduplication (prioritize complete results)
+
     merged_results = _merge_results_by_afid(all_results)
-    
-    # Sort merged results by original index and convert to DataFrame
-    merged_results.sort(key=lambda x: x[0])  # Sort by original index
+    merged_results.sort(key=lambda x: x[0])
     classification_results = [result[1] for result in merged_results]
     results = pd.DataFrame(classification_results)
 
-    # Merge results back to original dataframe by afid
     results_with_afid = results.set_index("afid")
-    
-    # Standardize column names expected by the user.
     df["org_type"] = df["afid"].map(results_with_afid["org_type"])
     df["gov_level"] = df["afid"].map(results_with_afid["gov_level"])
     df["gov_local_type"] = df["afid"].map(results_with_afid["gov_local_type"])
@@ -452,8 +462,6 @@ def main() -> None:
     df["confidence_gov_level"] = df["afid"].map(results_with_afid["confidence_gov_level"])
     df["confidence_mission_research"] = df["afid"].map(results_with_afid["confidence_mission_research"])
     df["rationale"] = df["afid"].map(results_with_afid["rationale"])
-
-    # Add ROR fields from the enriched results dicts
     df["ror_id"] = df["afid"].map(results_with_afid["ror_id"])
     df["ror_name"] = df["afid"].map(results_with_afid["ror_name"])
     df["ror_types"] = df["afid"].map(results_with_afid["ror_types"]).apply(
@@ -467,11 +475,8 @@ def main() -> None:
     )
     df["ror_match_score"] = df["afid"].map(results_with_afid["ror_match_score"])
     df["suggested_org_type_from_ror"] = df["afid"].map(results_with_afid["suggested_org_type_from_ror"])
-
-    # Ensure no NaN values remain in analytical fields (safety net)
     df = _ensure_no_nan(df)
 
-    # Remove columns that are no longer used analytically before writing CSV
     columns_to_drop = [
         "confidence_org_type",
         "confidence_gov_level",
@@ -481,9 +486,43 @@ def main() -> None:
     existing_columns_to_drop = [col for col in columns_to_drop if col in df.columns]
     if existing_columns_to_drop:
         df = df.drop(columns=existing_columns_to_drop)
+    return df
+
+
+def main() -> None:
+    global ENABLE_INDIVIDUAL_FALLBACK
+    args = _parse_args()
+
+    ENABLE_INDIVIDUAL_FALLBACK = args.enable_individual_fallback
+    if ENABLE_INDIVIDUAL_FALLBACK:
+        LOGGER.info("Individual fallback ENABLED (debugging mode - slower)")
+    else:
+        LOGGER.info("Individual fallback DISABLED (production mode - faster)")
+
+    # Configurar backend
+    backend_type = args.backend
+    if backend_type == "gemini":
+        config = {"api_key": args.gemini_api_key}
+    else:
+        config = {
+            "base_url": args.local_url,
+            "model_name": args.local_model,
+        }
+    backend = get_classifier(backend_type, config)
+    set_default_backend(backend)
+    LOGGER.info("Using backend: %s", backend_type)
+
+    LOGGER.info("Reading input CSV: %s", args.input)
+    df = pd.read_csv(args.input)
+
+    out_df = run_classification_pipeline(
+        df,
+        ror_path=args.ror_path,
+        enable_individual_fallback=ENABLE_INDIVIDUAL_FALLBACK,
+    )
 
     LOGGER.info("Writing output CSV: %s", args.output)
-    df.to_csv(args.output, index=False)
+    out_df.to_csv(args.output, index=False)
     LOGGER.info("Done.")
 
 
