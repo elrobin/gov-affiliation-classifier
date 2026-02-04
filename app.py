@@ -14,7 +14,7 @@ import pandas as pd
 import streamlit as st
 
 from lm_client import get_classifier, set_default_backend
-from main import run_classification_pipeline
+from main import OUTPUT_COLUMN_ORDER, run_classification_pipeline
 
 # Configurar logging para que no sature la consola en Streamlit
 logging.basicConfig(
@@ -148,11 +148,17 @@ if uploaded_file is not None:
             progress_bar.progress(1.0, text="Listo.")
             status_placeholder.success("Clasificación completada.")
 
+            # Orden de columnas: mismo que pipeline (afid, affiliation, country_code, sector, org_type, mission_research_category, gov_level, mission_research, ror_*)
+            if "sector" not in out_df.columns:
+                st.warning("La columna 'sector' no está presente en el resultado. Puede que el backend no la haya devuelto.")
+            preview_cols = [c for c in OUTPUT_COLUMN_ORDER if c in out_df.columns]
+            out_df = out_df[preview_cols]
+
             # Vista previa
             st.subheader("Vista previa del resultado")
             st.dataframe(out_df.head(20), use_container_width=True)
 
-            # Descarga
+            # Descarga (sin rationale ni gov_local_type)
             buffer = io.BytesIO()
             out_df.to_csv(buffer, index=False, encoding="utf-8")
             buffer.seek(0)

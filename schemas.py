@@ -12,15 +12,24 @@ from pydantic import BaseModel, Field
 
 
 # Literales para la taxonomía (valores permitidos)
-OrgType = Literal[
-    "supranational_organization",
+Sector = Literal[
     "government",
+    "academic",
+    "corporate",
+    "non_profit",
+    "international_organization",
+    "unknown",
+]
+
+OrgType = Literal[
     "university",
     "research_institute",
+    "hospital_clinic",
+    "government_agency",
+    "military",
+    "museum_park_library",
     "company",
-    "ngo",
-    "hospital",
-    "other",
+    "association_foundation",
     "unknown",
 ]
 
@@ -45,6 +54,7 @@ MissionResearchCategory = Literal[
     "Enabler",
     "AppliedResearch",
     "AcademicResearch",
+    "ExperimentalDevelopment",
     "unknown",
 ]
 
@@ -53,9 +63,10 @@ class ClassificationResult(BaseModel):
     """
     Resultado de clasificación de una afiliación.
 
-    Todos los backends (Gemini, Local) deben devolver exactamente estos campos.
+    Todos los backends (Gemini, Local) devuelven estos campos. Sin rationale (omitido para velocidad).
     """
 
+    sector: Sector = Field(..., description="Sector institucional")
     org_type: OrgType = Field(..., description="Tipo de organización")
     gov_level: GovLevel = Field(..., description="Nivel de gobierno si aplica")
     gov_local_type: GovLocalType = Field(..., description="Tipo local si gov_level=local")
@@ -63,7 +74,6 @@ class ClassificationResult(BaseModel):
         ..., description="Categoría de misión investigadora"
     )
     mission_research: int = Field(..., ge=0, le=1, description="1 si tiene misión investigación, 0 si no")
-    rationale: str = Field(default="", description="Justificación breve")
 
     # Campos opcionales para compatibilidad con reglas y CSV
     confidence_org_type: Optional[float] = None
@@ -83,26 +93,31 @@ def classification_result_from_dict(data: dict[str, Any]) -> ClassificationResul
     Construye un ClassificationResult desde un dict (p. ej. respuesta del LLM).
     Aplica valores por defecto para campos faltantes o inválidos.
     """
+    valid_sectors: set[str] = {"government", "academic", "corporate", "non_profit", "international_organization", "unknown"}
     valid_org_types: set[str] = {
-        "supranational_organization", "government", "university", "research_institute",
-        "company", "ngo", "hospital", "other", "unknown",
+        "university", "research_institute", "hospital_clinic", "government_agency", "military",
+        "museum_park_library", "company", "association_foundation", "unknown",
     }
     valid_gov_levels: set[str] = {"federal", "state", "local", "unknown", "non_applicable"}
     valid_gov_local: set[str] = {"city", "county", "other_local", "unknown", "non_applicable"}
-    valid_mission: set[str] = {"NonResearch", "Enabler", "AppliedResearch", "AcademicResearch", "unknown"}
+    valid_mission: set[str] = {"NonResearch", "Enabler", "AppliedResearch", "AcademicResearch", "ExperimentalDevelopment", "unknown"}
+
+    sector = data.get("sector") or "unknown"
+    if sector not in valid_sectors:
+        sector = "unknown"
 
     org_type = data.get("org_type") or "unknown"
     if org_type not in valid_org_types:
         org_type = "unknown"
 
     gov_level = data.get("gov_level") or "non_applicable"
-    if org_type != "government":
+    if sector != "government":
         gov_level = "non_applicable"
     elif gov_level not in valid_gov_levels:
         gov_level = "unknown"
 
     gov_local_type = data.get("gov_local_type") or "non_applicable"
-    if org_type != "government" or gov_level != "local":
+    if sector != "government" or gov_level != "local":
         gov_local_type = "non_applicable"
     elif gov_local_type not in valid_gov_local:
         gov_local_type = "unknown"
@@ -113,15 +128,15 @@ def classification_result_from_dict(data: dict[str, Any]) -> ClassificationResul
 
     mission_research = data.get("mission_research")
     if mission_research not in (0, 1):
-        mission_research = 1 if mission_category in ("AppliedResearch", "AcademicResearch") else 0
+        mission_research = 1 if mission_category in ("AppliedResearch", "AcademicResearch", "ExperimentalDevelopment") else 0
 
     return ClassificationResult(
+        sector=sector,
         org_type=org_type,
         gov_level=gov_level,
         gov_local_type=gov_local_type,
         mission_research_category=mission_category,
         mission_research=int(mission_research),
-        rationale=str(data.get("rationale", "") or ""),
         confidence_org_type=data.get("confidence_org_type"),
         confidence_gov_level=data.get("confidence_gov_level"),
         confidence_mission_research=data.get("confidence_mission_research"),

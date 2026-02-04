@@ -31,6 +31,27 @@ LOGGER = logging.getLogger("gov-affiliation-classifier")
 # Set to True for debugging to enable individual reprocessing on technical errors
 ENABLE_INDIVIDUAL_FALLBACK = False
 
+# Orden exacto de columnas del CSV de salida (sin rationale ni gov_local_type)
+OUTPUT_COLUMN_ORDER = [
+    "afid",
+    "affiliation",
+    "country_code",
+    "sector",
+    "org_type",
+    "mission_research_category",
+    "gov_level",
+    "mission_research",
+    "ror_id",
+    "ror_name",
+    "ror_types",
+    "ror_country_code",
+    "ror_state",
+    "ror_city",
+    "ror_domains",
+    "ror_match_score",
+    "suggested_org_type_from_ror",
+]
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -94,15 +115,15 @@ def _classify_row(row: pd.Series, ror_match: Optional[RorMatch] = None) -> Dict[
             err,
         )
         return {
-            "org_type": None,
-            "gov_level": None,
-            "gov_local_type": None,
-            "mission_research_category": None,
-            "mission_research": None,
-            "confidence_org_type": None,  # Kept for CSV compatibility
-            "confidence_gov_level": None,  # Kept for CSV compatibility
-            "confidence_mission_research": None,  # Kept for CSV compatibility
-            "rationale": f"Error: {err}",
+            "sector": "unknown",
+            "org_type": "unknown",
+            "gov_level": "unknown",
+            "gov_local_type": "unknown",
+            "mission_research_category": "unknown",
+            "mission_research": 0,
+            "confidence_org_type": None,
+            "confidence_gov_level": None,
+            "confidence_mission_research": None,
         }
 
 
@@ -142,6 +163,7 @@ def _ensure_no_nan(df: pd.DataFrame) -> pd.DataFrame:
     This is a safety net to ensure no NaN values are written to the CSV.
     """
     analytical_fields = [
+        "sector",
         "org_type",
         "gov_level",
         "gov_local_type",
@@ -378,6 +400,7 @@ def _process_batch(
                 for item in llm_items:
                     unknown_result = {
                         "afid": item["id"],
+                        "sector": "unknown",
                         "org_type": "unknown",
                         "gov_level": "unknown",
                         "gov_local_type": "unknown",
@@ -386,7 +409,6 @@ def _process_batch(
                         "confidence_org_type": None,
                         "confidence_gov_level": None,
                         "confidence_mission_research": None,
-                        "rationale": f"Batch error: {err}",
                     }
                     result_dict = _attach_ror_fields(unknown_result, item.get("ror_match"))
                     results.append((item["original_idx"], result_dict))
@@ -458,15 +480,12 @@ def run_classification_pipeline(
     def _get(row_id: str, key: str, default: Any = "unknown") -> Any:
         return lookup.get(row_id, {}).get(key, default)
 
+    df["sector"] = df["afid"].map(lambda x: _get(x, "sector", "unknown"))
     df["org_type"] = df["afid"].map(lambda x: _get(x, "org_type", "unknown"))
     df["gov_level"] = df["afid"].map(lambda x: _get(x, "gov_level", "unknown"))
     df["gov_local_type"] = df["afid"].map(lambda x: _get(x, "gov_local_type", "unknown"))
     df["mission_research_category"] = df["afid"].map(lambda x: _get(x, "mission_research_category", "unknown"))
     df["mission_research"] = df["afid"].map(lambda x: _get(x, "mission_research", 0))
-    df["confidence_org_type"] = df["afid"].map(lambda x: _get(x, "confidence_org_type"))
-    df["confidence_gov_level"] = df["afid"].map(lambda x: _get(x, "confidence_gov_level"))
-    df["confidence_mission_research"] = df["afid"].map(lambda x: _get(x, "confidence_mission_research"))
-    df["rationale"] = df["afid"].map(lambda x: _get(x, "rationale", ""))
     df["ror_id"] = df["afid"].map(lambda x: _get(x, "ror_id"))
     df["ror_name"] = df["afid"].map(lambda x: _get(x, "ror_name"))
     def _ror_list_to_str(v: Any) -> str:
@@ -481,15 +500,9 @@ def run_classification_pipeline(
     df["suggested_org_type_from_ror"] = df["afid"].map(lambda x: _get(x, "suggested_org_type_from_ror"))
     df = _ensure_no_nan(df)
 
-    columns_to_drop = [
-        "confidence_org_type",
-        "confidence_gov_level",
-        "confidence_mission_research",
-        "rationale",
-    ]
-    existing_columns_to_drop = [col for col in columns_to_drop if col in df.columns]
-    if existing_columns_to_drop:
-        df = df.drop(columns=existing_columns_to_drop)
+    # Orden y limpieza: solo columnas deseadas, en el orden exacto (sin rationale, gov_local_type, confidence_*)
+    cols_present = [c for c in OUTPUT_COLUMN_ORDER if c in df.columns]
+    df = df[cols_present]
     return df
 
 
