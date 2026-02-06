@@ -371,7 +371,109 @@ def _parsed_to_result_dict(parsed: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Regla basada en reglas (conservada)
+# Keyword rules (deterministic, run BEFORE LLM)
+# ---------------------------------------------------------------------------
+
+def apply_keyword_rules(affiliation: str) -> Optional[Dict[str, Any]]:
+    """
+    Heurísticas por palabras clave: National Park, servicios locales, protección académica,
+    Defense, VAMC, Federal Labs. Si alguna regla coincide, devuelve el diccionario completo;
+    si no, devuelve None y se debe llamar al LLM.
+    El resultado se pasa por _parsed_to_result_dict para completar gov_local_type, mission_research, etc.
+    """
+    aff = (affiliation or "").strip()
+    if not aff:
+        return None
+    aff_lower = aff.lower()
+
+    # Regla National Park (nivel federal)
+    if "national park" in aff_lower:
+        return {
+            "sector": "government",
+            "org_type": "museum_park_library",
+            "gov_level": "federal",
+            "mission_research_category": "NonResearch",
+        }
+
+    # Regla Servicios Locales (bomberos/policía/sheriff)
+    if any(kw in aff_lower for kw in ["fire department", "police department", "sheriff"]):
+        return {
+            "sector": "government",
+            "org_type": "government_agency",
+            "gov_level": "local",
+            "mission_research_category": "NonResearch",
+        }
+
+    # Regla Protección Académica (School of / College of / Faculty of)
+    if any(kw in aff_lower for kw in ["school of", "college of", "faculty of"]):
+        return {
+            "sector": "academic",
+            "org_type": "university",
+            "gov_level": "non_applicable",
+            "mission_research_category": "AcademicResearch",
+        }
+
+    # Regla Veterans/VAMC (antes que Defense para que VAMC no se clasifique como agency)
+    if "vamc" in aff_lower or "veterans affairs medical center" in aff_lower:
+        return {
+            "sector": "government",
+            "org_type": "hospital_clinic",
+            "gov_level": "federal",
+            "mission_research_category": "NonResearch",
+        }
+
+    # Regla Defense (excepción: si contiene Hospital o Medical Center → hospital_clinic)
+    defense_keywords = [
+        "department of defense",
+        "dod",
+        "army",
+        "navy",
+        "air force",
+        "united states, department of",
+        "us, department of",
+    ]
+    if any(kw in aff_lower for kw in defense_keywords):
+        if "hospital" in aff_lower or "medical center" in aff_lower:
+            return {
+                "sector": "government",
+                "org_type": "hospital_clinic",
+                "gov_level": "federal",
+                "mission_research_category": "NonResearch",
+            }
+        return {
+            "sector": "government",
+            "org_type": "government_agency",
+            "gov_level": "federal",
+            "mission_research_category": "NonResearch",
+        }
+
+    # Regla Federal Labs (Research Center/Lab sin indicios de empresa ni universidad)
+    has_research_venue = (
+        "research center" in aff_lower
+        or "research lab" in aff_lower
+        or "research laboratory" in aff_lower
+    )
+    corporate_academic_cues = [
+        " inc",
+        " corp",
+        " ltd",
+        " co.",
+        "university",
+        "college",
+    ]
+    if has_research_venue and not any(cue in aff_lower for cue in corporate_academic_cues):
+        return {
+            "sector": "government",
+            "org_type": "research_institute",
+            "gov_level": "federal",
+            "mission_research_category": "AppliedResearch",
+        }
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Regla basada en reglas (conservada, usa ROR)
 # ---------------------------------------------------------------------------
 
 def try_rule_based_classification(
@@ -821,16 +923,18 @@ def classify_affiliation(
 ) -> Dict[str, Any]:
     """
     Clasifica una afiliación usando el backend indicado o el por defecto.
-    affiliation y country_code se convierten a str() antes de enviar al backend.
+    Primero se aplican las keyword rules (Defense, VAMC, Federal Labs); si coinciden, se devuelve
+    el resultado sin llamar al LLM. Si no, se llama al backend.
     """
+    aff = str(affiliation) if affiliation is not None else ""
+    country_code = str(country_code) if country_code is not None else ""
+    kw_result = apply_keyword_rules(aff)
+    if kw_result is not None:
+        return _parsed_to_result_dict(kw_result)
     b = backend or _default_backend
     if b is None:
         b = LocalBackend({})  # fallback: LM Studio por defecto
-    return b.classify_affiliation(
-        str(affiliation) if affiliation is not None else "",
-        str(country_code) if country_code is not None else "",
-        ror_match,
-    )
+    return b.classify_affiliation(aff, country_code, ror_match)
 
 
 def classify_affiliations_batch(
@@ -839,9 +943,25 @@ def classify_affiliations_batch(
     backend: Optional[LLMBackend] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Clasifica varias afiliaciones en batch usando el backend indicado o el por defecto.
+    Clasifica varias afiliaciones en batch. Primero se aplican keyword rules por ítem;
+    los que coincidan devuelven resultado sin LLM; el resto se envía al backend en batch.
+    El orden de salida coincide con el de items.
     """
-    b = backend or _default_backend
-    if b is None:
-        b = LocalBackend({})
-    return b.classify_affiliations_batch(items, max_retries)
+    results_by_id: Dict[Any, Dict[str, Any]] = {}
+    llm_items: List[Dict[str, Any]] = []
+    for item in items:
+        aff = str(item.get("affiliation", "") or "").strip()
+        kw_result = apply_keyword_rules(aff)
+        if kw_result is not None:
+            normalized = _parsed_to_result_dict(kw_result)
+            normalized["id"] = item["id"]
+            results_by_id[item["id"]] = normalized
+        else:
+            llm_items.append(item)
+    if llm_items:
+        b = backend or _default_backend
+        if b is None:
+            b = LocalBackend({})
+        for res in b.classify_affiliations_batch(llm_items, max_retries):
+            results_by_id[res["id"]] = res
+    return [results_by_id[item["id"]] for item in items]

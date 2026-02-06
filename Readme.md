@@ -1,9 +1,8 @@
 # Gov Affiliation Classifier
 
-A Python utility for classifying institutional affiliations using a hybrid approach combining:
-- **ROR (Research Organization Registry)** knowledge base for fast matching
-- **Rule-based classification** for clear cases (universities, funders, teaching hospitals)
-- **LLM classification** for complex or ambiguous cases, via **Local** (LM Studio) or **Cloud** (Google Gemini) backends
+A Python tool to classify institutional affiliations (e.g. from paper authors) into a standard taxonomy: sector, organization type, government level, and research mission category. It combines keyword heuristics, the ROR knowledge base, and a language model (local via LM Studio or cloud via Google Gemini).
+
+**New to the tool?** To use the graphical interface on your computer with a local model (no API key or internet required for the LLM), follow the [Tutorial: Local setup with LM Studio](#tutorial-local-setup-with-lm-studio) below.
 
 The classifier determines:
 - **Sector** (`sector`): government, academic, corporate, non_profit, international_organization, or unknown
@@ -22,7 +21,7 @@ The classifier supports two backends; choose one at runtime (CLI or Streamlit):
 | Backend | Description | Use case |
 |--------|-------------|----------|
 | **Local (LM Studio)** | OpenAI-compatible API (e.g. LM Studio). Uses `openai` client with `base_url` and optional `model_name`. | Private, offline, or custom models. |
-| **Nube (Gemini)** | Google Gemini API via direct HTTP (`requests`). URL: `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`. | Google AI Studio; models such as `gemini-2.0-flash-lite`. |
+| **Cloud (Gemini)** | Google Gemini API via direct HTTP (`requests`). URL: `https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent`. | Google AI Studio; models such as `gemini-2.0-flash-lite`. |
 
 - **Rule of thumb:** Try rule-based classification first; if it returns no result, call the selected LLM backend.
 - No API keys are hardcoded: use config, CLI args, or environment variables (`GEMINI_API_KEY`, `LM_STUDIO_BASE_URL`, etc.).
@@ -74,27 +73,76 @@ The classifier produces a CSV with the following fields:
 - **Geographic:** `gov_level` is primarily validated for U.S. affiliations; for other countries, values may be `unknown` or `non_applicable`.
 - **Academic use:** This tool is for **research analysis** and does not aim to reproduce official administrative classifications.
 
+## Prerequisites
+
+- **Python 3.10 or higher** installed. If not, download from [python.org](https://www.python.org/downloads/). On Windows, tick "Add Python to PATH" during installation.
+- For **local** use: a computer with at least 8 GB RAM (16 GB or more is better for a 7B-parameter model).
+
 ## Installation
 
-1. Install dependencies:
+1. Clone or download this repository and open a terminal in the project folder.
+
+2. Create a virtual environment (recommended) and install dependencies:
    ```bash
+   python -m venv venv
+   venv\Scripts\activate
    pip install -r requirements.txt
    ```
+   (On macOS/Linux use `source venv/bin/activate`.)
 
-2. Main dependencies (see `requirements.txt` for versions):
-   - **pandas** – CSV processing
-   - **requests** – HTTP client (used for Gemini API and general requests)
-   - **openai** – OpenAI-compatible client (used for Local / LM Studio backend)
-   - **python-dotenv** – Environment variable management
-   - **rapidfuzz** – Fuzzy matching for ROR
-   - **streamlit** – Web UI (optional, for `app.py`)
-   - **pydantic** – Schema validation (taxonomy)
+3. Main dependencies (see `requirements.txt`):
+   - **pandas** – CSV read/write
+   - **openai** – LM Studio–compatible client (local backend)
+   - **requests** – HTTP (Gemini)
+   - **streamlit** – Web UI
+   - **rapidfuzz** – ROR matching
+   - **pydantic** – Taxonomy validation
 
-3. Ensure you have:
-   - For **Local:** An LM Studio (or OpenAI-compatible) server and, if needed, a ROR dump file.
-   - For **Gemini:** A Google AI Studio API key (set `GEMINI_API_KEY` or pass via config/UI). No API keys are hardcoded in the codebase.
+4. For **local** mode you need LM Studio with a model loaded and the server running (see tutorial below).  
+   For **Gemini** you need an API key from [Google AI Studio](https://aistudio.google.com/) (set `GEMINI_API_KEY` or enter it in the UI).
 
-**Nota (modo local):** Para el modo local, es necesario cargar el modelo en LM Studio y activar el servidor en el puerto 1234.
+## Tutorial: Local setup with LM Studio
+
+This section walks you through running the **graphical interface** with a **local model** (no API key, works offline after setup).
+
+### Step 1: Install LM Studio
+
+1. Go to [lmstudio.ai](https://lmstudio.ai/) and download LM Studio for your operating system.
+2. Install and open LM Studio.
+
+### Step 2: Download and load a model
+
+1. In LM Studio, open the **Discover** (or **Search**) tab and search for a model that fits your RAM (e.g. a 7B model for 8–16 GB RAM). Models like **Mistral 7B**, **Llama 3.2**, or **Phi-3** are common choices.
+2. Download the model (GGUF format). This may take several minutes.
+3. Open the **Chat** or **Local Server** tab and **load** the model you downloaded (click **Load model** and select it). Wait until it shows “Loaded”.
+
+### Step 3: Start the local server
+
+1. In LM Studio, open the **Local Server** (or **Developer**) tab.
+2. Click **Start Server**. The server usually runs at `http://localhost:1234`.
+3. Leave LM Studio open and the server running while you use the classifier.
+
+### Step 4: Run the classifier app
+
+1. In a terminal, activate your virtual environment and go to the project folder.
+2. Run:
+   ```bash
+   streamlit run app.py
+   ```
+3. Your browser will open the Streamlit interface (e.g. `http://localhost:8501`).
+
+### Step 5: Use your own data
+
+1. In the sidebar, leave **Local (LM Studio / OpenAI-compatible)** selected. The Base URL should be `http://localhost:1234/v1`. If your model has a specific name in LM Studio, enter it in **Model name (optional)**; otherwise leave it blank.
+2. (Optional) If you have a ROR data JSON file, enter its path in **Path to ROR JSON (optional)**.
+3. Prepare a CSV with **exactly** these columns:
+   - **afid** – unique identifier for each row (e.g. 1, 2, 3 or author IDs)
+   - **affiliation** – the raw affiliation string (e.g. "Department of Energy", "Harvard University")
+   - **country_code** – ISO 2-letter country code (e.g. US, GB, FR)
+4. Click **Upload your CSV** and select your file.
+5. Click **Classify**. The app will process rows in batches (keyword rules first, then the LLM when needed). When it finishes, you will see a preview and a **Download result CSV** button.
+
+The output CSV will contain the original columns plus: **sector**, **org_type**, **mission_research_category**, **gov_level**, **mission_research**, and ROR fields if you provided a ROR file.
 
 ## Usage
 
@@ -139,9 +187,9 @@ No API keys or secrets are hardcoded; always use config, CLI, or environment.
 
 ## Troubleshooting
 
-### Error 429 (Google / Gemini – Cuotas)
+### Error 429 (Google / Gemini – Quotas)
 
-When using the **Gemini** backend, Google may return **429 Too Many Requests** (rate limit / quota exceeded).
+When using the **Gemini** backend, Google may return **429 Too Many Requests** (rate limit or quota exceeded).
 
 - **Reduce request rate:** The Gemini client uses a **4-second delay** (`time.sleep(4)`) between each individual request to stay under free-tier limits.
 - **Use a lighter model:** The default model is `gemini-2.0-flash-lite`, which typically has a more generous free quota. You can change it in the Streamlit sidebar or via config/CLI.
@@ -178,8 +226,10 @@ Classification flow: ROR match → rule-based classification → if no result, c
 
 ## License
 
-[Add your license information here]
+This project is licensed under **Creative Commons Attribution-NonCommercial-ShareAlike (CC BY-NC-SA)**. You may share and adapt the material for non-commercial purposes, with attribution and under the same license. See [Creative Commons BY-NC-SA](https://creativecommons.org/licenses/by-nc-sa/4.0/) for details.
 
 ## Contributing
 
-[Add contribution guidelines if applicable]
+This project was developed by **Nicolás Robinson-Garcia** at the **Unit for Computational Humanities and Social Sciences (UCHASS)**, University of Granada. It was created in the framework of a collaboration for a study on co-production and collaboration between academia and government, in collaboration with **Julia Melkers** and **Luyu Du** at the **Centre for the Organization of Research Design (CORD)**, Arizona State University.
+
+For questions or collaboration, please open an issue or contact the authors.
